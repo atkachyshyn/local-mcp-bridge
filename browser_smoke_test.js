@@ -90,6 +90,26 @@ assert.throws(() => globalThis.LBP.normalizeTask({
   ]
 }), /exactly one/);
 
+const parserTaskText = `<LBP_TASK>
+{
+  "protocol": "lbp",
+  "version": "1.2",
+  "id": "parser-lines",
+  "operation": { "type": "mcp.list_tools", "server": "workspace" }
+}
+</LBP_TASK>`;
+assert.equal(globalThis.LBP.extractTasks(parserTaskText).length, 1, 'line-isolated envelope should parse');
+assert.equal(
+  globalThis.LBP.extractTasks(`prefix <LBP_TASK>\n{"protocol":"lbp"}\n</LBP_TASK>`).length,
+  0,
+  'inline/prose envelope markers must not parse'
+);
+assert.equal(
+  globalThis.LBP.extractResults(globalThis.LBP.resultEnvelope({ task_id: "parser-result", status: "ok" }))[0].task_id,
+  "parser-result",
+  'generated fenced result envelope must round-trip through the parser'
+);
+
 const envelope = '```text\n<LBP_RESULT>\n{"task_id":"t1","status":"ok"}\n</LBP_RESULT>\n```';
 composer.innerText = '```text\n\n<LBP_RESULT>\n  {"task_id":"t1","status":"ok"}\n</LBP_RESULT>\n```';
 assert.equal(adapter.composerMatches(envelope), true, 'whitespace normalization should preserve a single exact envelope');
@@ -115,3 +135,24 @@ assert.equal(adapter.findLastMessageHost(), assistant1, 'latest assistant should
   assert.equal(send.clicked, 1, 'changed composer must not click Send');
   console.log('browser_smoke_test.js: PASS');
 })().catch((err) => { console.error(err); process.exit(1); });
+
+// v0.9.1 regression: content-script DOM observer must not synchronously rescan
+// mutations created by Local MCP Bridge's own UI.
+const contentSource = fs.readFileSync('extension/content.js', 'utf8');
+
+assert(
+  contentSource.includes('mutationIsBridgeUiOnly'),
+  'content script must identify bridge-owned DOM mutations'
+);
+
+assert(
+  contentSource.includes('mutations.every(mutationIsBridgeUiOnly)'),
+  'MutationObserver must ignore mutations caused only by bridge UI'
+);
+
+assert(
+  contentSource.includes('scheduleScan()'),
+  'MutationObserver must debounce/schedule scans instead of calling scan synchronously'
+);
+
+console.log('content observer regression: PASS');

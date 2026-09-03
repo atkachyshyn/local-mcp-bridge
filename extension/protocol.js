@@ -6,8 +6,10 @@ globalThis.LBP = (() => {
   ];
   const RESULT_ENVELOPE = { start: "<LBP_RESULT>", end: "</LBP_RESULT>" };
   const MAX_OBSERVE_CALLS = 8;
+  const MAX_MUTATE_CALLS = 8;
+  const SUPPORTED_TASK_VERSIONS = new Set(["1.2", "1.3"]);
 
-  function normalizeCall(raw, requireId = false) {
+  function normalizeCall(raw, requireId = false, operationType = "MCP") {
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
       throw new Error("MCP call must be a JSON object");
     }
@@ -21,14 +23,14 @@ globalThis.LBP = (() => {
     if (!args || typeof args !== "object" || Array.isArray(args)) throw new Error("MCP call arguments must be an object");
     const value = { tool: raw.tool, arguments: args };
     if (requireId) {
-      if (typeof raw.id !== "string" || !raw.id.trim()) throw new Error("mcp.observe calls require an id");
+      if (typeof raw.id !== "string" || !raw.id.trim()) throw new Error(`${operationType} calls require an id`);
       value.id = raw.id.trim();
     }
     if (typeof raw.description === "string") value.description = raw.description;
     return value;
   }
 
-  function normalizeOperation(raw) {
+  function normalizeOperation(raw, version) {
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
       throw new Error("task operation must be a JSON object");
     }
@@ -37,21 +39,27 @@ globalThis.LBP = (() => {
     if (op.type === "mcp_list_tools") op.type = "mcp.list_tools";
     for (const key of ["mutating", "required", "classification"]) {
       if (Object.prototype.hasOwnProperty.call(op, key)) {
-        throw new Error("LBP 1.2 derives classification and authority locally");
+        throw new Error("LBP derives classification and authority locally");
       }
     }
-    if (!["mcp.call", "mcp.list_tools", "mcp.observe"].includes(op.type)) {
-      throw new Error("LBP 1.2 supports mcp.call, mcp.list_tools and mcp.observe");
+    if (!["mcp.call", "mcp.list_tools", "mcp.observe", "mcp.mutate"].includes(op.type)) {
+      throw new Error("LBP supports mcp.call, mcp.list_tools, mcp.observe and mcp.mutate");
+    }
+    if (op.type === "mcp.mutate" && version !== "1.3") {
+      throw new Error("mcp.mutate requires LBP 1.3");
     }
     if (typeof op.server !== "string" || !op.server) throw new Error(`${op.type}.server is required`);
-    if (op.type === "mcp.list_tools") return { type: op.type, server: op.server, ...(typeof op.description === "string" ? { description: op.description } : {}) };
-    if (op.type === "mcp.observe") {
-      if (!Array.isArray(op.calls) || op.calls.length < 1 || op.calls.length > MAX_OBSERVE_CALLS) {
-        throw new Error(`mcp.observe requires 1..${MAX_OBSERVE_CALLS} calls`);
+    if (op.type === "mcp.list_tools") {
+      return { type: op.type, server: op.server, ...(typeof op.description === "string" ? { description: op.description } : {}) };
+    }
+    if (op.type === "mcp.observe" || op.type === "mcp.mutate") {
+      const maxCalls = op.type === "mcp.observe" ? MAX_OBSERVE_CALLS : MAX_MUTATE_CALLS;
+      if (!Array.isArray(op.calls) || op.calls.length < 1 || op.calls.length > maxCalls) {
+        throw new Error(`${op.type} requires 1..${maxCalls} calls`);
       }
-      const calls = op.calls.map((call) => normalizeCall(call, true));
+      const calls = op.calls.map((call) => normalizeCall(call, true, op.type));
       const ids = new Set(calls.map((call) => call.id));
-      if (ids.size !== calls.length) throw new Error("mcp.observe call ids must be unique");
+      if (ids.size !== calls.length) throw new Error(`${op.type} call ids must be unique`);
       return {
         type: op.type,
         server: op.server,
@@ -67,6 +75,8 @@ globalThis.LBP = (() => {
       throw new Error("task must be a JSON object");
     }
     if (raw.protocol && raw.protocol !== "lbp") throw new Error("task.protocol must be 'lbp'");
+    const version = raw.version === undefined || raw.version === null ? "1.2" : String(raw.version);
+    if (!SUPPORTED_TASK_VERSIONS.has(version)) throw new Error(`unsupported LBP task version ${version}`);
 
     let operation = raw.operation;
     if (!operation && Array.isArray(raw.operations)) {
@@ -83,9 +93,9 @@ globalThis.LBP = (() => {
 
     const task = {
       protocol: "lbp",
-      version: "1.2",
+      version,
       id: raw.id,
-      operation: normalizeOperation(operation)
+      operation: normalizeOperation(operation, version)
     };
     for (const key of ["title", "description", "action_label"]) {
       if (typeof raw[key] === "string") task[key] = raw[key];
@@ -96,13 +106,20 @@ globalThis.LBP = (() => {
 
   function extractBetween(text, envelope, parse) {
     const found = [];
-    let cursor = 0;
-    while (true) {
-      const start = text.indexOf(envelope.start, cursor);
-      if (start < 0) break;
-      const end = text.indexOf(envelope.end, start + envelope.start.length);
-      if (end < 0) break;
-      const jsonText = text.slice(start + envelope.start.length, end).trim();
+    const lines = String(text || "").split("\n");
+    const offsets = [];
+    let offset = 0;
+    for (const line of lines) {
+      offsets.push(offset);
+      offset += line.length + 1;
+    }
+    for (let index = 0; index < lines.length; index += 1) {
+      if (lines[index].trim() !== envelope.start) continue;
+      let endIndex = index + 1;
+      while (endIndex < lines.length && lines[endIndex].trim() !== envelope.end) endIndex += 1;
+      if (endIndex >= lines.length) continue;
+      const jsonText = lines.slice(index + 1, endIndex).join("\n").trim();
+      const start = offsets[index] + Math.max(0, lines[index].indexOf(envelope.start));
       try {
         found.push({ position: start, value: parse(JSON.parse(jsonText)) });
       } catch (error) {
@@ -111,7 +128,7 @@ globalThis.LBP = (() => {
           value: { __parse_error: String(error.message || error), __raw: jsonText }
         });
       }
-      cursor = end + envelope.end.length;
+      index = endIndex;
     }
     return found;
   }
@@ -145,6 +162,7 @@ globalThis.LBP = (() => {
     ENVELOPES,
     RESULT_ENVELOPE,
     MAX_OBSERVE_CALLS,
+    MAX_MUTATE_CALLS,
     extractTasks,
     extractResults,
     resultEnvelope,

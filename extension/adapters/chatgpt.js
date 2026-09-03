@@ -122,6 +122,93 @@ globalThis.LBP_PROVIDER_ADAPTER = (() => {
     return { inserted: false, reason: "composer_unavailable", copied: true };
   }
 
+  function prependComposerText(text) {
+    const composer = findComposer();
+    const prefix = String(text || "").trim();
+    if (!composer || !prefix) return { prepended: false, reason: "composer_unavailable" };
+
+    const current = composerText(composer);
+    const next = current.trim() ? `${prefix}\n\n${current}` : prefix;
+    composer.focus();
+
+    if (composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement) {
+      const proto = composer instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+      if (setter) setter.call(composer, next);
+      else composer.value = next;
+      composer.dispatchEvent(new Event("input", { bubbles: true }));
+      composer.dispatchEvent(new Event("change", { bubbles: true }));
+      return { prepended: true, text: next };
+    }
+
+    try {
+      const selection = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(composer);
+      range.collapse(true);
+      selection.removeAllRanges();
+      selection.addRange(range);
+      const inserted = current.trim() ? `${prefix}\n\n` : prefix;
+      document.execCommand("insertText", false, inserted);
+      composer.dispatchEvent(new InputEvent("input", {
+        bubbles: true,
+        inputType: "insertText",
+        data: inserted
+      }));
+      return { prepended: normalizedText(composerText(composer)).startsWith(normalizedText(prefix)), text: composerText(composer) };
+    } catch (_) {
+      return { prepended: false, reason: "composer_update_failed" };
+    }
+  }
+
+  function onBeforeUserSend(callback) {
+    if (typeof callback !== "function") throw new Error("onBeforeUserSend requires a callback");
+
+    function isPureLbpResult() {
+      const text = composerText().trim();
+      return markerCount(text, "<LBP_RESULT>") === 1 &&
+        markerCount(text, "</LBP_RESULT>") === 1 &&
+        globalThis.LBP.extractResults(text).length === 1;
+    }
+
+    function notify(event) {
+      if (isPureLbpResult()) return;
+      const text = composerText().trim();
+      if (!text) return;
+      callback({ event, text });
+    }
+
+    const submitHandler = (event) => {
+      const composer = findComposer();
+      if (!composer || event.target !== composer.closest("form")) return;
+      notify(event);
+    };
+
+    const clickHandler = (event) => {
+      const composer = findComposer();
+      const send = findSendButton(composer);
+      if (!send || event.target !== send && !send.contains?.(event.target)) return;
+      notify(event);
+    };
+
+    const keyHandler = (event) => {
+      if (event.key !== "Enter" || event.shiftKey || event.metaKey || event.ctrlKey || event.altKey || event.isComposing) return;
+      const composer = findComposer();
+      if (!composer || event.target !== composer && !composer.contains?.(event.target)) return;
+      notify(event);
+    };
+
+    document.addEventListener("submit", submitHandler, true);
+    document.addEventListener("click", clickHandler, true);
+    document.addEventListener("keydown", keyHandler, true);
+
+    return () => {
+      document.removeEventListener("submit", submitHandler, true);
+      document.removeEventListener("click", clickHandler, true);
+      document.removeEventListener("keydown", keyHandler, true);
+    };
+  }
+
   async function submitComposer(expectedText = null) {
     if (expectedText !== null && !composerMatches(expectedText)) {
       return { submitted: false, reason: "composer_changed" };
@@ -146,6 +233,7 @@ globalThis.LBP_PROVIDER_ADAPTER = (() => {
     providerHost: () => location.hostname,
     findTaskHosts: () => Array.from(document.querySelectorAll('[data-message-author-role="assistant"]')),
     findResultHosts: () => Array.from(document.querySelectorAll('[data-message-author-role="user"]')),
+    findAllMessageHosts: allMessageHosts,
     findLastMessageHost: () => {
       const hosts = allMessageHosts();
       return hosts.length ? hosts[hosts.length - 1] : null;
@@ -156,6 +244,8 @@ globalThis.LBP_PROVIDER_ADAPTER = (() => {
     composerMatches,
     waitUntilIdle,
     insertResult,
+    prependComposerText,
+    onBeforeUserSend,
     submitComposer
   });
 })();

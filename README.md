@@ -4,7 +4,7 @@ Local MCP Bridge connects a browser-based AI chat to explicitly configured **loc
 
 It is designed for development workflows where the browser model remains the reasoning surface while local tools stay behind local, deny-by-default policy.
 
-> **Status: experimental v0.9.0.** The implementation has regression coverage and security hardening, but v0.9 has not yet completed an independent security review. Do not treat it as a security sandbox. Review the policy model before enabling write, destructive, or VERIFY authority.
+> **Status: experimental v0.9.1.** The implementation has regression coverage and security hardening, but v0.9 has not yet completed an independent security review. Do not treat it as a security sandbox. Review the policy model before enabling write, destructive, or VERIFY authority.
 
 ## What problem it solves
 
@@ -27,6 +27,21 @@ Configured local MCP servers
 ```
 
 The bridge does **not** provide native same-generation tool execution. Local results return as the next user turn. Auto-continue can submit those turns automatically, but they remain real conversation turns.
+
+## v0.9.1 corrections
+
+v0.9.1 keeps LBP 1.2 and the v0.9 execution model, but fixes policy and browser UX issues found during live self-hosting:
+
+- `allowed_tools: ["*"]` means any tool currently present in the live MCP `tools/list` catalog; every other policy gate still applies.
+- A narrowly matched daemon-owned VERIFY rule may reclassify a generic command tool that its MCP server conservatively marks WRITE **or DESTRUCTIVE**.
+- LBP envelope parsing requires line-isolated markers and is designed for fenced `text` code blocks.
+- Hidden protocol payloads never gate task discovery or execution.
+- Round-trip counting anchors to the latest genuine user prompt and self-heals from actual LBP result turns.
+- Task status has exactly one selected surface: right-side panel, inline in chat, or off.
+- Raw LBP task/result JSON is hidden by default and is available only as technical/debug information.
+- The right-side panel shows sequential task history/status for the current chain.
+- Approval dialogs show a human summary first; raw arguments are collapsed under **Technical details**.
+- The panel includes **Prime chat**, which inserts a real user-turn bootstrap explaining LBP 1.2. Browser extensions cannot secretly modify ChatGPT's hidden system context, so a real conversation turn is the reliable bootstrap mechanism.
 
 ## v0.9 execution model
 
@@ -124,7 +139,7 @@ The recommended development default is `mutations`.
 The extension injects a persistent status chip on supported ChatGPT pages. It can show:
 
 ```text
-LBP ● Connected · v0.9.0
+LBP ● Connected · v0.9.1
 LBP ◌ Checking · workspace → observe ×3
 LBP ◌ Running · workspace → run_command
 LBP ⚠ Approval required · workspace → apply_patch

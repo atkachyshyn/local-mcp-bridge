@@ -81,7 +81,7 @@ class MockMcp(BaseHTTPRequestHandler):
                 {"name": "read_file", "description": "read", "inputSchema": {"type": "object"}, "annotations": {"readOnlyHint": True}},
                 {"name": "flaky_read", "description": "read after restart", "inputSchema": {"type": "object"}, "annotations": {"readOnlyHint": True}},
                 {"name": "slow_read", "description": "slow read", "inputSchema": {"type": "object"}, "annotations": {"readOnlyHint": True}},
-                {"name": "run_command", "description": "command", "inputSchema": {"type": "object"}, "annotations": {"readOnlyHint": False}},
+                {"name": "run_command", "description": "command", "inputSchema": {"type": "object"}, "annotations": {"readOnlyHint": False, "destructiveHint": True}},
                 {"name": "apply_patch", "description": "write", "inputSchema": {"type": "object"}, "annotations": {"readOnlyHint": False}},
                 {"name": "delete_all", "description": "destroy", "inputSchema": {"type": "object"}, "annotations": {"destructiveHint": True}},
             ]
@@ -141,7 +141,7 @@ def wait_health(port: int):
 def task(task_id, tool, path):
     return {
         "protocol": "lbp",
-        "version": "1.2",
+        "version": "1.3",
         "id": task_id,
         "title": "smoke",
         "description": "test",
@@ -163,7 +163,7 @@ def task_args(task_id, tool, arguments):
 def observe_task(task_id, calls):
     return {
         "protocol": "lbp",
-        "version": "1.2",
+        "version": "1.3",
         "id": task_id,
         "title": "observe smoke",
         "description": "grouped reads and verification",
@@ -223,8 +223,8 @@ def main():
             wait_health(bridge_port)
 
             status, health = request(bridge_port, "GET", "/health")
-            assert status == 200 and health["protocols"][0]["versions"] == ["1.2"]
-            assert set(health["operations"]) == {"mcp.call", "mcp.list_tools", "mcp.observe"}
+            assert status == 200 and health["protocols"][0]["versions"] == ["1.3"]
+            assert set(health["operations"]) == {"mcp.call", "mcp.list_tools", "mcp.observe", "mcp.mutate"}
             assert health["max_observe_calls"] == 8
 
             legacy_single = {
@@ -258,6 +258,33 @@ def main():
             assert tested["result"]["tool_count"] == 6
             assert any(t["name"] == "read_file" and t["classification"] == "read_only" for t in tested["result"]["tools"])
 
+            # Wildcard expands only live-catalog eligibility. It must not bypass
+            # tool existence or the remaining daemon policy gates.
+            status, wildcard_registry = request(bridge_port, "GET", "/v1/servers")
+            wildcard_servers = wildcard_registry["servers"]
+            wildcard_servers["workspace"]["allowed_tools"] = ["*"]
+            status, wildcard_saved = request(bridge_port, "POST", "/v1/servers", {
+                "servers": wildcard_servers,
+                "expected_version": wildcard_registry["version"],
+            })
+            assert status == 200, wildcard_saved
+
+            status, wildcard_read = request(
+                bridge_port, "POST", "/v1/tasks/preview", task("wildcard-read", "read_file", target)
+            )
+            assert status == 200, wildcard_read
+
+            missing_tool = task("wildcard-missing", "does_not_exist", target)
+            status, missing_tool_resp = request(bridge_port, "POST", "/v1/tasks/preview", missing_tool)
+            assert status == 400 and "tool_not_found" in missing_tool_resp["error"]
+
+            status, wildcard_restore = request(bridge_port, "POST", "/v1/servers", {
+                "servers": servers,
+                "expected_version": wildcard_saved["version"],
+            })
+            assert status == 200, wildcard_restore
+            first_version = wildcard_restore["version"]
+
             # The client must use the negotiated version after initialize, and omit it on initialize itself.
             init_calls = [c for c in MockMcp.calls if c["method"] == "initialize"]
             assert init_calls and all(c["protocol_header"] is None for c in init_calls)
@@ -268,7 +295,7 @@ def main():
             status, preview = request(bridge_port, "POST", "/v1/tasks/preview", read_task)
             assert status == 200, preview
             assert preview["preview"]["operation"]["classification"] == "read_only"
-            assert preview["preview"]["operation"]["path_checks"][0]["root"] == str(project)
+            assert preview["preview"]["operation"]["path_checks"][0]["root"] == str(project.resolve())
 
             status, denied_path = request(bridge_port, "POST", "/v1/tasks/preview", task("outside", "read_file", outside))
             assert status == 400 and "path_policy_denied" in denied_path["error"]
@@ -411,7 +438,7 @@ def main():
             assert status == 400 and "path_policy_denied" in denied["error"]
             allowed_unknown_key = task_args("path-weird-allowed", "apply_patch", {"filename": str(target)})
             status, allowed_preview = request(bridge_port, "POST", "/v1/tasks/preview", allowed_unknown_key)
-            assert status == 200 and allowed_preview["preview"]["operation"]["path_checks"][0]["root"] == str(project)
+            assert status == 200 and allowed_preview["preview"]["operation"]["path_checks"][0]["root"] == str(project.resolve())
             non_path_text = task_args("non-path-text", "apply_patch", {"note": "hello/world", "patch": "diff --git a/x b/x\n+const p = '/etc/passwd';"})
             status, non_path_preview = request(bridge_port, "POST", "/v1/tasks/preview", non_path_text)
             assert status == 200 and non_path_preview["preview"]["operation"]["path_checks"] == []

@@ -11,17 +11,21 @@ function fnv1a(text) {
   return (hash >>> 0).toString(16).padStart(8, "0");
 }
 
+function scopedConversationId(sender) {
+  let path = "/";
+  try { path = new URL(sender.tab?.url || "").pathname || "/"; } catch (_) {}
+  return `chat-${fnv1a(path)}`;
+}
+
 function scopedSessionId(message, sender) {
   const raw = typeof message?.sessionId === "string" ? message.sessionId : "";
   const tabId = Number.isInteger(sender.tab?.id) ? sender.tab.id : 0;
-  let conversation = "unknown";
-  try { conversation = fnv1a(new URL(sender.tab?.url || "").pathname || "/"); } catch (_) {}
-  return `${raw}.t${tabId}.c${conversation}`.slice(0, 128);
+  return `${raw}.t${tabId}.${scopedConversationId(sender)}`.slice(0, 128);
 }
 
 function validSender(message, sender) {
   if (sender.id !== chrome.runtime.id) return false;
-  if (["lbp-run", "lbp-preview", "lbp-approve"].includes(message?.type)) {
+  if (["lbp-run", "lbp-preview", "lbp-approve", "lbp-conversation-state"].includes(message?.type)) {
     try {
       const url = new URL(sender.tab?.url || "");
       return url.protocol === "https:" && CHAT_HOSTS.has(url.hostname);
@@ -60,10 +64,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   };
 
   if (message.type === "lbp-health") return reply(request("/health"));
+  if (message.type === "lbp-conversation-state") {
+    return reply(request("/v1/conversation-state", {
+      method: "POST",
+      body: JSON.stringify({
+        conversation_id: scopedConversationId(sender),
+        action: message.action || "get",
+        payload: message.payload && typeof message.payload === "object" ? message.payload : {}
+      })
+    }));
+  }
   if (message.type === "lbp-preview") {
     return reply(request("/v1/tasks/preview", {
       method: "POST",
-      body: JSON.stringify({ task: message.task, session_id: scopedSessionId(message, sender) })
+      body: JSON.stringify({ task: message.task, session_id: scopedSessionId(message, sender),
+        chain_id: message.chainId || null })
     }));
   }
   if (message.type === "lbp-approve") {
@@ -72,6 +87,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       body: JSON.stringify({
         task: message.task,
         session_id: scopedSessionId(message, sender),
+        chain_id: message.chainId || null,
         decision: message.decision
       })
     }));
@@ -82,6 +98,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       body: JSON.stringify({
         task: message.task,
         session_id: scopedSessionId(message, sender),
+        chain_id: message.chainId || null,
         approval_token: message.approvalToken || null
       })
     }));

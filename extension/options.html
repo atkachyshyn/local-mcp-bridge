@@ -11,14 +11,14 @@
     <header>
       <div class="kicker">LOCAL MCP BRIDGE</div>
       <h1>MCP servers & policy</h1>
-      <p>The daemon owns this configuration. Servers are denied by default: choose tools, roots, write authority, and how often local approval is required.</p>
+      <p>The daemon owns local authority. Browser settings below control continuation and presentation only.</p>
     </header>
 
     <div id="daemon" class="daemon">Checking local bridge…</div>
 
     <section class="interaction-card">
       <div class="policy-title interaction-title">Browser-chat interaction</div>
-      <p class="interaction-help">This controls only the browser adapter. Local MCP authority still comes exclusively from daemon server/tool/root policy.</p>
+      <p class="interaction-help">Choose one execution-history surface. Technical LBP payloads stay collapsed by default and never gate execution.</p>
       <div class="policy-grid">
         <label class="wide"><span>Result continuation</span>
           <select id="interaction-mode">
@@ -26,10 +26,17 @@
             <option value="auto_continue">Auto-continue · submit local results as the next user turn</option>
           </select>
         </label>
-        <label><span>Maximum automatic local round trips per user prompt</span><div class="with-suffix"><input id="interaction-max-rounds" type="number" min="1" max="50" value="12"><span>turns</span></div></label>
-        <label class="toggle"><input id="interaction-collapse" type="checkbox" checked> Collapse LBP task/result payloads in chat</label>
+        <label><span>Automatic task checkpoint interval</span><div class="with-suffix"><input id="interaction-max-rounds" type="number" min="1" max="50" value="12"><span>tasks</span></div><small>At each checkpoint the bridge pauses locally before posting the next result. Continue another window or stop the chain.</small></label>
+        <label><span>Execution history display</span>
+          <select id="interaction-status-surface">
+            <option value="panel">Right-side panel</option>
+            <option value="inline">Inline in chat</option>
+            <option value="off">Off</option>
+          </select>
+        </label>
+        <label class="toggle wide"><input id="interaction-show-protocol" type="checkbox"> Expand technical LBP payloads by default</label>
       </div>
-      <p class="interaction-note">Auto-continue is turn-chained, not same-run tool calling: each local result is sent as a real user turn after the assistant has finished its current response. It pauses instead of sending if your composer contains a draft, the provider is still generating, correlation changes, or the round-trip cap is reached.</p>
+      <p class="interaction-note">Recommended: Auto-continue + Right-side panel + technical payloads collapsed. The checkpoint is a human continuation gate, not a hard chain limit. Daemon policy still decides tools, roots, VERIFY, writes, destructive operations, and approvals.</p>
     </section>
 
     <section id="servers"></section>
@@ -57,18 +64,26 @@
       <div class="policy-title">Local policy</div>
       <div class="policy-grid">
         <label class="wide"><span>Allowed roots · one absolute directory per line</span><textarea class="server-roots" rows="3" placeholder="/absolute/path/to/your/repository"></textarea></label>
-        <label class="wide"><span>Allowed MCP tools · one name per line</span><textarea class="server-tools" rows="5" placeholder="read_file&#10;search_content&#10;hash_file"></textarea></label>
+        <label class="wide"><span>Allowed MCP tools · one name per line</span><textarea class="server-tools" rows="5" placeholder="*"></textarea><small><code>*</code> means any tool currently present in this server's live tools/list catalog. It does not bypass roots, classification, write/destructive policy, VERIFY rules, or approvals.</small></label>
         <label class="toggle wide"><input class="server-verify" type="checkbox"> Allow locally approved verification commands (VERIFY)</label>
-        <label class="wide"><span>Verification rules · local JSON policy, never model-authored</span><textarea class="server-verification-rules" rows="8" placeholder='[{"tool":"run_command","argument":"command","cwd_argument":"cwd","argv_prefixes":[["cargo","test"],["cargo","check"],["cargo","clippy"],["cargo","fmt","--check"]]}]'></textarea><small>Only a base WRITE tool can become VERIFY. The call must include an absolute cwd inside an allowed root; argv must match a configured prefix. Shell control operators fail closed.</small></label>
+        <label class="wide"><span>Verification rules · local JSON policy, never model-authored</span><textarea class="server-verification-rules" rows="8" placeholder='[{"tool":"run_command","argument":"command","cwd_argument":"cwd","argv_prefixes":[["cargo","test"],["cargo","check"],["cargo","clippy"],["cargo","fmt","--check"]]}]'></textarea><small>A locally matched generic command tool may become VERIFY even when the MCP server conservatively marks it destructive. The call must include an absolute cwd inside an allowed root; argv must match a configured prefix. Shell control operators fail closed.</small></label>
         <label class="toggle"><input class="server-write" type="checkbox"> Allow write tools</label>
         <label class="toggle"><input class="server-destructive" type="checkbox"> Allow destructive tools</label>
         <label class="wide"><span>Approval behavior</span>
           <select class="server-approval-mode">
             <option value="all">Approve every operation</option>
             <option value="session">Approve once per tab/conversation / risk level · 2h lease</option>
-            <option value="mutations">Auto-run reads + VERIFY; approve every mutation</option>
+            <option value="mutations">Auto-run reads + VERIFY; approve mutations</option>
             <option value="none">No approval prompts; enforce policy only</option>
           </select>
+        </label>
+        <label class="wide"><span>Approval popup escalation</span>
+          <select class="server-approval-escalation">
+            <option value="once">Allow once only</option>
+            <option value="chain">Offer approval until next user message</option>
+            <option value="session">Offer next-message or session approval</option>
+          </select>
+          <small>This only controls the broadest temporary scope the popup may offer. Approval until the next user message lasts for the current genuine-user-request chain; the automatic 12-task continuation checkpoint does not reset it. It never weakens the baseline policy, and the destructive hard gate remains independent.</small>
         </label>
         <label class="toggle wide"><input class="server-destructive-approval" type="checkbox" checked> Always ask before destructive operations</label>
       </div>

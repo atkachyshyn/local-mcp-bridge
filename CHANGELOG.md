@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.9.1 — 2026-09-02
+
+Focused live-self-hosting compatibility and UX release; LBP remains **1.2**.
+
+- Adds `allowed_tools: ["*"]` as live-catalog eligibility only.
+- Allows a narrow daemon-owned VERIFY rule to reclassify a generic command tool from base WRITE or DESTRUCTIVE to VERIFY.
+- Hardens task/result parsing around line-isolated envelope markers and fenced-code-block transport.
+- Fixes hidden payloads accidentally becoming an execution gate.
+- Fixes per-prompt round-trip accounting and reconstructs progress from real LBP result turns.
+- Replaces duplicate task/status surfaces with one configurable surface: right-side panel, inline, or off.
+- Adds sequential current-chain task status to the right-side panel.
+- Hides raw protocol payloads by default; technical payload visibility is explicit.
+- Simplifies approval UI by keeping raw MCP arguments behind a Technical details disclosure.
+- Adds a Prime chat action for inserting the LBP usage bootstrap as a real user turn.
+- Updates daemon/extension version to 0.9.1 and expands regression coverage.
+
 ## 0.9.0 — 2026-09-02
 
 v0.9 evolves the v0.8 security-corrected bridge without restoring the old unrestricted `operations[]` workflow language.

@@ -1,0 +1,36 @@
+{
+  "workspace": {
+    "transport": "http",
+    "endpoint": "http://127.0.0.1:8001/mcp",
+    "timeout_s": 30,
+    "enabled": true,
+    "allowed_tools": [
+      "read_file",
+      "search_content",
+      "hash_file",
+      "run_command",
+      "apply_patch"
+    ],
+    "allow_verify": true,
+    "verification_rules": [
+      {
+        "tool": "run_command",
+        "argument": "command",
+        "cwd_argument": "cwd",
+        "argv_prefixes": [
+          ["cargo", "test"],
+          ["cargo", "check"],
+          ["cargo", "clippy"],
+          ["cargo", "fmt", "--check"]
+        ]
+      }
+    ],
+    "write": true,
+    "allow_destructive": false,
+    "roots": [
+      "/absolute/path/to/your/repository"
+    ],
+    "approval_mode": "mutations",
+    "always_approve_destructive": true
+  }
+}

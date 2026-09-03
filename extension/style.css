@@ -1,0 +1,171 @@
+.lbp-wrap {
+  position: relative;
+  box-sizing: border-box;
+  width: min(520px, calc(100% - 28px));
+  margin: 18px auto 6px;
+  padding: 17px 19px 14px;
+  border: 1px solid color-mix(in srgb, currentColor 13%, transparent);
+  border-radius: 16px;
+  background: color-mix(in srgb, currentColor 2.5%, transparent);
+  box-shadow: 0 1px 2px color-mix(in srgb, currentColor 5%, transparent);
+  text-align: left;
+  font-size: 13px;
+  line-height: 1.42;
+}
+.lbp-mutating { border-width: 2px; }
+.lbp-settings {
+  position: absolute; top: 10px; right: 11px; width: 28px; height: 28px; padding: 0;
+  border: 0; border-radius: 50%; background: transparent; color: inherit; opacity: .5;
+  cursor: pointer; font: inherit; font-size: 15px;
+}
+.lbp-settings:hover { opacity: .9; background: color-mix(in srgb, currentColor 7%, transparent); }
+.lbp-eyebrow { text-align: center; font-size: 10px; font-weight: 700; letter-spacing: .12em; opacity: .45; margin-bottom: 3px; }
+.lbp-heading { padding: 0 28px; text-align: center; font-size: 14px; font-weight: 650; margin-bottom: 5px; }
+.lbp-description { max-width: 450px; margin: 0 auto 11px; text-align: center; opacity: .7; }
+.lbp-details { margin: 8px auto 10px; max-width: 460px; opacity: .78; text-align: center; }
+.lbp-details summary { cursor: pointer; user-select: none; }
+.lbp-operation-tech { display: block; margin: 6px auto 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; opacity: .68; overflow-wrap: anywhere; }
+.lbp-actions { display: flex; justify-content: center; margin-top: 11px; }
+.lbp-run {
+  appearance: none; min-width: 150px; border: 1px solid color-mix(in srgb, currentColor 20%, transparent);
+  background: color-mix(in srgb, currentColor 7%, transparent); color: inherit; border-radius: 10px;
+  padding: 8px 17px; cursor: pointer; font: inherit; font-weight: 650; text-align: center;
+  transition: background .12s ease, transform .12s ease;
+}
+.lbp-run:hover:not(:disabled) { background: color-mix(in srgb, currentColor 12%, transparent); }
+.lbp-run:active:not(:disabled) { transform: translateY(1px); }
+.lbp-run:disabled { opacity: .5; cursor: default; }
+.lbp-status { min-height: 18px; margin-top: 8px; text-align: center; opacity: .64; overflow-wrap: anywhere; }
+
+.lbp-modal-overlay {
+  position: fixed; inset: 0; z-index: 2147483647; display: flex; align-items: center; justify-content: center;
+  padding: 24px; box-sizing: border-box; background: rgba(0,0,0,.48); backdrop-filter: blur(2px);
+}
+.lbp-modal {
+  box-sizing: border-box; width: min(720px, 100%); max-height: min(760px, calc(100vh - 48px)); overflow: auto;
+  padding: 20px; border: 1px solid color-mix(in srgb, CanvasText 18%, transparent); border-radius: 16px;
+  background: Canvas; color: CanvasText; box-shadow: 0 18px 60px rgba(0,0,0,.28); font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+.lbp-modal-write { border-width: 2px; }
+.lbp-modal-top { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.lbp-modal h3 { margin: 8px 0 6px; font-size: 18px; line-height: 1.25; }
+.lbp-model-intent { margin: 0 0 15px; opacity: .62; max-width: 66ch; }
+.lbp-badge { flex: none; padding: 4px 8px; border-radius: 999px; border: 1px solid color-mix(in srgb, currentColor 18%, transparent); font-size: 10px; font-weight: 750; letter-spacing: .06em; }
+.lbp-badge-read_only { opacity: .72; }
+.lbp-badge-write, .lbp-badge-destructive, .lbp-badge-unknown { border-width: 2px; }
+.lbp-derived-facts { display: grid; gap: 8px; padding: 12px; border-radius: 10px; background: color-mix(in srgb, currentColor 5%, transparent); }
+.lbp-derived-facts > div { display: grid; grid-template-columns: 105px 1fr; gap: 10px; align-items: start; }
+.lbp-derived-facts strong { font-size: 11px; opacity: .62; text-transform: uppercase; letter-spacing: .04em; }
+.lbp-derived-facts code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; overflow-wrap: anywhere; }
+.lbp-args-title { margin: 16px 0 6px; font-size: 12px; font-weight: 650; }
+.lbp-args { max-height: 310px; overflow: auto; margin: 0; padding: 12px; border: 1px solid color-mix(in srgb, currentColor 13%, transparent); border-radius: 10px; background: color-mix(in srgb, currentColor 3%, transparent); white-space: pre-wrap; overflow-wrap: anywhere; font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.lbp-provider-note { margin: 13px 0 0; font-size: 11px; opacity: .64; }
+.lbp-modal-actions { display: flex; justify-content: flex-end; gap: 9px; margin-top: 17px; }
+.lbp-modal-actions button { border-radius: 9px; padding: 8px 14px; font: inherit; font-weight: 650; cursor: pointer; color: inherit; }
+.lbp-modal-cancel { border: 1px solid color-mix(in srgb, currentColor 16%, transparent); background: transparent; }
+.lbp-modal-approve { border: 1px solid color-mix(in srgb, currentColor 24%, transparent); background: color-mix(in srgb, currentColor 10%, transparent); }
+@media (max-width: 600px) { .lbp-modal-overlay { padding: 10px; } .lbp-modal { max-height: calc(100vh - 20px); padding: 16px; } .lbp-derived-facts > div { grid-template-columns: 1fr; gap: 3px; } }
+
+/* v0.6 compact/plugin-like presentation */
+.lbp-wrap { width: min(440px, calc(100% - 28px)); padding: 11px 15px 10px; margin-top: 12px; }
+.lbp-heading { font-size: 13px; margin-bottom: 3px; }
+.lbp-details { margin: 4px auto 6px; font-size: 11px; }
+.lbp-actions:empty { display: none; }
+.lbp-payload-chip {
+  display: block; width: fit-content; margin: 5px auto; padding: 3px 8px;
+  border: 1px solid color-mix(in srgb, currentColor 12%, transparent); border-radius: 999px;
+  background: color-mix(in srgb, currentColor 4%, transparent); color: inherit;
+  opacity: .52; cursor: pointer; font: 10px/1.35 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+.lbp-payload-chip:hover { opacity: .85; }
+.lbp-modal-session {
+  border: 1px solid color-mix(in srgb, currentColor 28%, transparent);
+  background: color-mix(in srgb, currentColor 15%, transparent);
+}
+
+/* turn-chained auto-continue controls */
+.lbp-stop {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  padding: 7px 9px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+  opacity: .5;
+}
+.lbp-stop:hover { opacity: .9; }
+
+/* v0.9 persistent bridge status */
+.lbp-global-status {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 2147483000;
+  width: min(360px, calc(100vw - 36px));
+  color: CanvasText;
+  font: 12px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+.lbp-global-pill {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 100%;
+  border: 1px solid color-mix(in srgb, CanvasText 16%, transparent);
+  border-radius: 999px;
+  padding: 7px 11px;
+  background: Canvas;
+  color: CanvasText;
+  box-shadow: 0 4px 18px rgba(0,0,0,.14);
+  cursor: pointer;
+  font: inherit;
+}
+.lbp-global-dot {
+  width: 8px;
+  height: 8px;
+  flex: none;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: .65;
+}
+.lbp-global-main {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 650;
+}
+.lbp-global-panel {
+  margin-top: 7px;
+  padding: 12px;
+  border: 1px solid color-mix(in srgb, CanvasText 15%, transparent);
+  border-radius: 13px;
+  background: Canvas;
+  color: CanvasText;
+  box-shadow: 0 10px 32px rgba(0,0,0,.18);
+}
+.lbp-global-detail { overflow-wrap: anywhere; }
+.lbp-global-meta { margin-top: 6px; opacity: .58; font-size: 11px; }
+.lbp-global-actions { display: flex; justify-content: flex-end; gap: 7px; margin-top: 10px; }
+.lbp-global-actions button {
+  border: 1px solid color-mix(in srgb, CanvasText 15%, transparent);
+  border-radius: 8px;
+  padding: 6px 9px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+}
+.lbp-global-running .lbp-global-dot,
+.lbp-global-checking .lbp-global-dot,
+.lbp-global-continuing .lbp-global-dot { animation: lbp-pulse 1.1s ease-in-out infinite alternate; }
+.lbp-global-offline .lbp-global-pill,
+.lbp-global-error .lbp-global-pill,
+.lbp-global-approval .lbp-global-pill { border-width: 2px; }
+.lbp-global-paused .lbp-global-dot { opacity: .35; }
+.lbp-badge-verify { border-style: dashed; }
+@keyframes lbp-pulse { from { opacity: .28; transform: scale(.9); } to { opacity: .9; transform: scale(1.05); } }
+@media (max-width: 600px) {
+  .lbp-global-status { right: 10px; bottom: 10px; width: min(330px, calc(100vw - 20px)); }
+}

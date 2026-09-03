@@ -1,0 +1,47 @@
+{
+  "manifest_version": 3,
+  "name": "Local MCP Bridge",
+  "version": "0.9.0",
+  "description": "Bridge browser-chat LBP 1.2 tasks to policy-controlled local MCP servers with read/verify observation groups, exclusive writes, approvals and visible status.",
+  "permissions": [
+    "clipboardWrite",
+    "storage"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:8765/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Local MCP Bridge settings",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png"
+    }
+  },
+  "options_page": "options.html",
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*"
+      ],
+      "js": [
+        "protocol.js",
+        "adapters/chatgpt.js",
+        "content.js"
+      ],
+      "css": [
+        "style.css"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

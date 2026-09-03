@@ -1,0 +1,91 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Local MCP Bridge</title>
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
+  <main>
+    <header>
+      <div class="kicker">LOCAL MCP BRIDGE</div>
+      <h1>MCP servers & policy</h1>
+      <p>The daemon owns this configuration. Servers are denied by default: choose tools, roots, write authority, and how often local approval is required.</p>
+    </header>
+
+    <div id="daemon" class="daemon">Checking local bridge…</div>
+
+    <section class="interaction-card">
+      <div class="policy-title interaction-title">Browser-chat interaction</div>
+      <p class="interaction-help">This controls only the browser adapter. Local MCP authority still comes exclusively from daemon server/tool/root policy.</p>
+      <div class="policy-grid">
+        <label class="wide"><span>Result continuation</span>
+          <select id="interaction-mode">
+            <option value="manual">Manual · insert result into composer, I press Send</option>
+            <option value="auto_continue">Auto-continue · submit local results as the next user turn</option>
+          </select>
+        </label>
+        <label><span>Maximum automatic local round trips per user prompt</span><div class="with-suffix"><input id="interaction-max-rounds" type="number" min="1" max="50" value="12"><span>turns</span></div></label>
+        <label class="toggle"><input id="interaction-collapse" type="checkbox" checked> Collapse LBP task/result payloads in chat</label>
+      </div>
+      <p class="interaction-note">Auto-continue is turn-chained, not same-run tool calling: each local result is sent as a real user turn after the assistant has finished its current response. It pauses instead of sending if your composer contains a draft, the provider is still generating, correlation changes, or the round-trip cap is reached.</p>
+    </section>
+
+    <section id="servers"></section>
+
+    <div class="footer-actions">
+      <button id="add" class="secondary">+ Add MCP server</button>
+      <button id="save" class="primary">Save</button>
+    </div>
+    <div id="message" class="message"></div>
+  </main>
+
+  <template id="server-template">
+    <article class="server-card">
+      <div class="server-top">
+        <label class="enabled"><input class="server-enabled" type="checkbox" checked> Enabled</label>
+        <button class="remove" title="Remove server" aria-label="Remove server">×</button>
+      </div>
+
+      <div class="grid">
+        <label><span>Server ID</span><input class="server-id" placeholder="workspace"></label>
+        <label class="wide"><span>Endpoint</span><input class="server-endpoint" placeholder="http://127.0.0.1:8001/mcp"></label>
+        <label><span>Timeout</span><div class="with-suffix"><input class="server-timeout" type="number" min="1" max="180" value="30"><span>sec</span></div></label>
+      </div>
+
+      <div class="policy-title">Local policy</div>
+      <div class="policy-grid">
+        <label class="wide"><span>Allowed roots · one absolute directory per line</span><textarea class="server-roots" rows="3" placeholder="/absolute/path/to/your/repository"></textarea></label>
+        <label class="wide"><span>Allowed MCP tools · one name per line</span><textarea class="server-tools" rows="5" placeholder="read_file&#10;search_content&#10;hash_file"></textarea></label>
+        <label class="toggle wide"><input class="server-verify" type="checkbox"> Allow locally approved verification commands (VERIFY)</label>
+        <label class="wide"><span>Verification rules · local JSON policy, never model-authored</span><textarea class="server-verification-rules" rows="8" placeholder='[{"tool":"run_command","argument":"command","cwd_argument":"cwd","argv_prefixes":[["cargo","test"],["cargo","check"],["cargo","clippy"],["cargo","fmt","--check"]]}]'></textarea><small>Only a base WRITE tool can become VERIFY. The call must include an absolute cwd inside an allowed root; argv must match a configured prefix. Shell control operators fail closed.</small></label>
+        <label class="toggle"><input class="server-write" type="checkbox"> Allow write tools</label>
+        <label class="toggle"><input class="server-destructive" type="checkbox"> Allow destructive tools</label>
+        <label class="wide"><span>Approval behavior</span>
+          <select class="server-approval-mode">
+            <option value="all">Approve every operation</option>
+            <option value="session">Approve once per tab/conversation / risk level · 2h lease</option>
+            <option value="mutations">Auto-run reads + VERIFY; approve every mutation</option>
+            <option value="none">No approval prompts; enforce policy only</option>
+          </select>
+        </label>
+        <label class="toggle wide"><input class="server-destructive-approval" type="checkbox" checked> Always ask before destructive operations</label>
+      </div>
+      <div class="risk-warning" hidden></div>
+
+      <div class="server-actions">
+        <button class="test secondary">Test & discover tools</button>
+        <button class="allow-readonly secondary" disabled>Allow discovered read-only tools</button>
+      </div>
+      <div class="test-status"></div>
+      <details class="discovered-wrap" hidden>
+        <summary>Discovered tool classifications</summary>
+        <div class="discovered-tools"></div>
+      </details>
+    </article>
+  </template>
+
+  <script src="options.js"></script>
+</body>
+</html>

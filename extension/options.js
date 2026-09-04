@@ -17,7 +17,7 @@ function interactionConfig() {
 
   const max = Number(document.querySelector("#interaction-max-rounds").value);
   if (!Number.isInteger(max) || max < 1 || max > 50) {
-    throw new Error("Automatic task checkpoint interval must be an integer from 1 to 50 tasks.");
+    throw new Error("Checkpoint interval must be an integer from 1 to 50 steps.");
   }
 
   const status_surface = document.querySelector("#interaction-status-surface").value;
@@ -108,7 +108,8 @@ function serverConfig(card) {
       allow_destructive,
       approval_mode: card.querySelector(".server-approval-mode").value,
       approval_escalation: card.querySelector(".server-approval-escalation").value,
-      always_approve_destructive: card.querySelector(".server-destructive-approval").checked
+      always_approve_destructive: card.querySelector(".server-destructive-approval").checked,
+      freeform_write_tools: lines(card.querySelector(".server-freeform-write").value)
     }
   };
 }
@@ -201,6 +202,7 @@ function addServer(id = "", cfg = {}) {
   card.querySelector(".server-approval-mode").value = cfg.approval_mode || "mutations";
   card.querySelector(".server-approval-escalation").value = cfg.approval_escalation || "chain";
   card.querySelector(".server-destructive-approval").checked = cfg.always_approve_destructive !== false;
+  card.querySelector(".server-freeform-write").value = (cfg.freeform_write_tools || []).join("\n");
 
   card.querySelector(".server-write").addEventListener("change", (event) => {
     if (!event.currentTarget.checked) card.querySelector(".server-destructive").checked = false;

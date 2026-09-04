@@ -26,7 +26,7 @@
             <option value="auto_continue">Auto-continue · submit local results as the next user turn</option>
           </select>
         </label>
-        <label><span>Automatic task checkpoint interval</span><div class="with-suffix"><input id="interaction-max-rounds" type="number" min="1" max="50" value="12"><span>tasks</span></div><small>At each checkpoint the bridge pauses locally before posting the next result. Continue another window or stop the chain.</small></label>
+        <label><span>Checkpoint interval</span><div class="with-suffix"><input id="interaction-max-rounds" type="number" min="1" max="50" value="12"><span>steps</span></div><small>At each checkpoint the bridge pauses locally before posting the next result. Continue to the next checkpoint or stop the chain.</small></label>
         <label><span>Execution history display</span>
           <select id="interaction-status-surface">
             <option value="panel">Right-side panel</option>
@@ -83,8 +83,9 @@
             <option value="chain">Offer approval until next user message</option>
             <option value="session">Offer next-message or session approval</option>
           </select>
-          <small>This only controls the broadest temporary scope the popup may offer. Approval until the next user message lasts for the current genuine-user-request chain; the automatic 12-task continuation checkpoint does not reset it. It never weakens the baseline policy, and the destructive hard gate remains independent.</small>
+          <small>This only controls the broadest temporary scope the popup may offer. Approval until the next user message lasts for the current genuine-user-request chain; the automatic checkpoint does not reset it. It never weakens the baseline policy, and the destructive hard gate remains independent.</small>
         </label>
+        <label class="wide"><span>Free-form payload write tools · one name per line</span><textarea class="server-freeform-write" rows="3" placeholder="apply_patch"></textarea><small>Allowed roots inspect path-shaped <em>arguments</em>. They cannot look inside a free-form payload field (<code>patch</code>, <code>content</code>, <code>old</code>, <code>new</code>, <code>text</code>, <code>replacement</code>, <code>pattern</code>, <code>query</code>) &mdash; and for a patch-style tool that payload is where the write target lives, so roots constrain it not at all. Listing a tool here is an explicit acknowledgement of that. Leave empty to deny.</small></label>
         <label class="toggle wide"><input class="server-destructive-approval" type="checkbox" checked> Always ask before destructive operations</label>
       </div>
       <div class="risk-warning" hidden></div>

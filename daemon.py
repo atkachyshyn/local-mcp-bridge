@@ -10,6 +10,8 @@ import pathlib
 import secrets
 import shlex
 import socket
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -194,6 +196,15 @@ def validate_server_config(name: str, cfg: Any) -> dict[str, Any]:
         )
     always_approve_destructive = bool(cfg.get("always_approve_destructive", True))
 
+    # Explicit operator acknowledgement that configured roots cannot constrain
+    # these tools' free-form payload arguments. Deny-by-default.
+    freeform_raw = cfg.get("freeform_write_tools", [])
+    if not isinstance(freeform_raw, list):
+        raise ValueError(f"MCP server {name!r}: freeform_write_tools must be an array")
+    freeform_write_tools = sorted({
+        item for item in freeform_raw if isinstance(item, str) and item.strip()
+    })
+
     return {
         "transport": "http",
         "endpoint": endpoint,
@@ -208,6 +219,7 @@ def validate_server_config(name: str, cfg: Any) -> dict[str, Any]:
         "approval_mode": approval_mode,
         "approval_escalation": approval_escalation,
         "always_approve_destructive": always_approve_destructive,
+        "freeform_write_tools": freeform_write_tools,
     }
 
 
@@ -263,13 +275,71 @@ def atomic_write_json(path: pathlib.Path, value: Any) -> None:
                 pass
 
 
+# --- Conversation identity ---------------------------------------------------
+#
+# v0.9.2 conversation identity. Two shapes, distinguishable by prefix:
+#
+#   conv-<32 hex>   canonical. Derived by the extension from a stable provider
+#                   conversation identifier that the URL exposes publicly
+#                   (ChatGPT: the /c/<uuid> path segment). SHA-256, not FNV-1a.
+#
+#   prov-<32 hex>   provisional. A per-tab identity used before the provider has
+#                   assigned a conversation id (a brand new chat at "/", or a
+#                   project route that carries no conversation id). Provisional
+#                   state is per tab, never shared, and carries no approval
+#                   leases.
+#
+# The daemon treats both as opaque. It only needs the prefix to enforce the
+# migration rule in bind_conversation: provisional state may be promoted to a
+# canonical id exactly once, and canonical state is never copied anywhere.
+
+CONVERSATION_ID_PREFIXES = ("conv-", "prov-")
+CONVERSATION_SCHEMA = 2
+
+PHASES = {
+    "disabled",
+    "idle",
+    "awaiting_assistant",
+    "task_registered",
+    "executing",
+    "result_ready",
+    "checkpoint",
+    "stopped",
+    "unknown",
+}
+
+EXECUTION_STATUSES = {"registered", "running", "completed", "error", "unknown"}
+DELIVERY_STATUSES = {"none", "inserted", "submitted", "failed", "withheld"}
+PLAN_ITEM_STATUSES = {"pending", "current", "completed", "error", "unknown", "skipped"}
+OUTPUT_STATUSES = {"pending", "produced", "failed", "unknown"}
+
+# recent_tasks is a bounded presentation projection. No staleness, currentness or
+# duplicate-id decision may read it -- those all resolve against the durable
+# conversation-scoped journal. See task_journal_* below.
+MAX_RECENT_TASKS = 64
+OWNER_LEASE_SECONDS = 30
+
+# A registration that was never dispatched and has gone quiet must not be able to
+# hold the chain open forever. The coordinator is expected to call abandon_task
+# when the user denies a task or execution fails; this bound is the failsafe for
+# when it cannot (tab closed mid-dialog, crash between register and run).
+REGISTRATION_STALE_SECONDS = 15 * 60
+
+
 def validate_conversation_id(value: Any) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError("conversation_id must be a non-empty string")
     value = value.strip()
-    if len(value) > 128 or any(not (ch.isalnum() or ch in "._-") for ch in value):
-        raise ValueError("conversation_id contains invalid characters")
+    if not value.startswith(CONVERSATION_ID_PREFIXES):
+        raise ValueError("conversation_id must be a canonical 'conv-' or provisional 'prov-' identity")
+    body = value[5:]
+    if len(body) != 32 or any(ch not in "0123456789abcdef" for ch in body):
+        raise ValueError("conversation_id body must be 32 lowercase hex characters")
     return value
+
+
+def conversation_is_provisional(conversation_id: str) -> bool:
+    return conversation_id.startswith("prov-")
 
 
 def conversation_state_key(conversation_id: str) -> str:
@@ -288,20 +358,44 @@ def conversation_state_path(conversation_id: str) -> pathlib.Path:
 
 def default_conversation_state(conversation_id: str) -> dict[str, Any]:
     return {
-        "version": 1,
+        "schema": CONVERSATION_SCHEMA,
         "conversation_id": conversation_id,
+        "revision": 0,
+
+        # Persistent chat properties. Deliberately not collapsed into one
+        # "active" boolean: whether the bridge is switched on for this chat and
+        # where the chat is in an execution lifecycle are different questions.
         "enabled": False,
-        "active": False,
+        "workflow_attached": False,
         "mode": "manual",
         "checkpoint_size": 12,
-        "chain_id": None,
-        "human_anchor": None,
-        "state": "inactive",
-        "task_count_total": 0,
-        "checkpoint_window": 0,
-        "window_task_count": 0,
-        "checkpoint_pending": False,
-        "tasks": [],
+
+        "phase": "disabled",
+        "stopped_reason": None,
+
+        # Enable baseline. Historical tasks must never execute, and "the turns
+        # currently rendered" is exactly the quantity provider virtualization
+        # destroys -- enabling while scrolled up would otherwise record a
+        # baseline at an old turn and make everything after it eligible.
+        #
+        # So the baseline is established by OBSERVATION, not enumeration: after
+        # enable, no chain exists until the coordinator arms a genuine local
+        # send and a new user turn is then observed. Scrolling can never arm.
+        "baseline_at": None,
+        "pending_human_send": False,
+
+        "last_user_turn_id": None,
+        "last_assistant_turn_id": None,
+
+        "active_chain": None,
+        "current_task_id": None,
+        "current_registration": None,
+
+        "recent_tasks": [],
+        "plan": None,
+        "outputs": [],
+        "context": {"sources": [], "constraints": []},
+        "owner": None,
         "updated_at": int(time.time()),
     }
 
@@ -315,6 +409,11 @@ def load_conversation_state(conversation_id: str) -> dict[str, Any]:
         return default_conversation_state(conversation_id)
     if not isinstance(raw, dict) or raw.get("conversation_id") != conversation_id:
         raise ValueError("invalid persisted conversation state")
+    if int(raw.get("schema", 1)) != CONVERSATION_SCHEMA:
+        # A v1 state file cannot be safely upgraded: it has no baseline and no
+        # turn lineage, so promoting it would make its historical tasks eligible.
+        # Start clean and fail closed instead.
+        return default_conversation_state(conversation_id)
     return {**default_conversation_state(conversation_id), **raw}
 
 
@@ -322,119 +421,1170 @@ def save_conversation_state(state: dict[str, Any]) -> dict[str, Any]:
     conversation_id = validate_conversation_id(state.get("conversation_id"))
     state = dict(state)
     state["conversation_id"] = conversation_id
+    state["schema"] = CONVERSATION_SCHEMA
+    state["revision"] = int(state.get("revision", 0)) + 1
     state["updated_at"] = int(time.time())
     atomic_write_json(conversation_state_path(conversation_id), state)
     return state
 
 
+def context_source_id(kind: str, path: str, server: str) -> str:
+    digest = hashlib.sha256(f"{kind}\0{server}\0{path}".encode("utf-8")).hexdigest()
+    return f"ctx-{digest[:24]}"
+
+
+def folder_label(path: str) -> str:
+    name = pathlib.Path(path).name
+    return name or path
+
+
+def conversation_context_state(state: dict[str, Any]) -> dict[str, Any]:
+    raw = state.get("context") if isinstance(state.get("context"), dict) else {}
+    sources_raw = raw.get("sources", [])
+    constraints_raw = raw.get("constraints", [])
+    sources: list[dict[str, Any]] = []
+    if isinstance(sources_raw, list):
+        for item in sources_raw:
+            if not isinstance(item, dict):
+                continue
+            if item.get("kind") != "folder":
+                continue
+            path = item.get("path")
+            server = item.get("server")
+            source_id = item.get("id")
+            if not isinstance(path, str) or not path.strip():
+                continue
+            if not isinstance(server, str) or not server.strip():
+                continue
+            if not isinstance(source_id, str) or not source_id.startswith("ctx-"):
+                source_id = context_source_id("folder", path, server)
+            label = item.get("label")
+            sources.append({
+                "id": source_id[:80],
+                "kind": "folder",
+                "label": label.strip()[:200] if isinstance(label, str) and label.strip() else folder_label(path),
+                "path": path,
+                "server": server.strip()[:64],
+                "accessible": item.get("accessible") is not False,
+                "origin": "user",
+                "removable": True,
+                "added_at": int(item.get("added_at", 0) or 0),
+            })
+    constraints = [
+        item.strip()[:300]
+        for item in constraints_raw
+        if isinstance(item, str) and item.strip()
+    ] if isinstance(constraints_raw, list) else []
+    return {"sources": sources[-64:], "constraints": constraints[-64:]}
+
+
+def _path_within_root(path: pathlib.Path, root: pathlib.Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def match_configured_context_root(path: Any, preferred_server: Any = None) -> tuple[str, str, str] | None:
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError("context folder path must be a non-empty string")
+    selected = pathlib.Path(path).expanduser()
+    if not selected.is_absolute():
+        raise ValueError("context folder path must be absolute")
+    resolved = selected.resolve(strict=False)
+
+    preferred = preferred_server.strip() if isinstance(preferred_server, str) and preferred_server.strip() else None
+    matches: list[tuple[int, str, str]] = []
+    for server, cfg in sorted(servers_snapshot().items()):
+        if preferred and server != preferred:
+            continue
+        if not cfg.get("enabled", True):
+            continue
+        for root_raw in cfg.get("roots", []):
+            root = pathlib.Path(root_raw).expanduser().resolve(strict=False)
+            if _path_within_root(resolved, root):
+                matches.append((len(root.parts), server, str(root)))
+    if not matches:
+        return None
+    _, server, root = sorted(matches, key=lambda item: item[0], reverse=True)[0]
+    return str(resolved), server, root
+
+
+def context_source_for_folder(path: Any, preferred_server: Any = None, label: Any = None) -> dict[str, Any]:
+    match = match_configured_context_root(path, preferred_server)
+    if match is None:
+        raise ValueError("context_folder_outside_roots: Folder is outside the currently allowed MCP roots.")
+    resolved, server, root = match
+    text_label = label.strip()[:200] if isinstance(label, str) and label.strip() else folder_label(resolved)
+    return {
+        "id": context_source_id("folder", resolved, server),
+        "kind": "folder",
+        "label": text_label,
+        "path": resolved,
+        "server": server,
+        "accessible": True,
+        "origin": "user",
+        "removable": True,
+        "root": root,
+    }
+
+
+def refresh_context_source_access(source: dict[str, Any]) -> dict[str, Any]:
+    out = dict(source)
+    try:
+        match = match_configured_context_root(out.get("path"), out.get("server"))
+    except ValueError:
+        match = None
+    out["accessible"] = match is not None
+    if match is not None:
+        out["path"], out["server"], out["root"] = match
+    else:
+        out.pop("root", None)
+    return out
+
+
+def configured_context_workspaces() -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for server, cfg in sorted(servers_snapshot().items()):
+        if not cfg.get("enabled", True):
+            continue
+        for root in cfg.get("roots", []):
+            try:
+                source = context_source_for_folder(root, server)
+            except ValueError:
+                continue
+            key = source["id"]
+            if key in seen:
+                continue
+            seen.add(key)
+            entries.append(source)
+    return entries
+
+
+def _folder_picker_result(path: str) -> dict[str, Any]:
+    path = path.strip()
+    if not path:
+        return {"cancelled": True}
+    resolved = pathlib.Path(path).expanduser().resolve(strict=False)
+    if not resolved.is_absolute():
+        raise ValueError("folder_picker_failed: selected folder was not an absolute path")
+    return {"cancelled": False, "path": str(resolved)}
+
+
+def choose_context_folder_native() -> dict[str, Any]:
+    """Open a local folder picker from an explicit browser click."""
+    if sys.platform == "darwin":
+        script = 'POSIX path of (choose folder with prompt "Choose a folder to add to Context")'
+        proc = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+        if proc.returncode == 0:
+            return _folder_picker_result(proc.stdout)
+        stderr = (proc.stderr or "").strip()
+        if proc.returncode == 1 or "User canceled" in stderr or "-128" in stderr:
+            return {"cancelled": True}
+        raise ValueError(f"folder_picker_failed: {stderr or 'osascript failed'}")
+
+    if sys.platform.startswith("win"):
+        command = (
+            "Add-Type -AssemblyName System.Windows.Forms; "
+            "$d = New-Object System.Windows.Forms.FolderBrowserDialog; "
+            "$d.Description = 'Choose a folder to add to Context'; "
+            "if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) "
+            "{ [Console]::WriteLine($d.SelectedPath) }"
+        )
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-STA", "-Command", command],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+        if proc.returncode == 0:
+            return _folder_picker_result(proc.stdout)
+        raise ValueError(f"folder_picker_failed: {(proc.stderr or '').strip() or 'PowerShell failed'}")
+
+    for command in (
+        ["zenity", "--file-selection", "--directory", "--title=Choose a folder to add to Context"],
+        ["kdialog", "--getexistingdirectory", str(pathlib.Path.home())],
+    ):
+        try:
+            proc = subprocess.run(command, capture_output=True, text=True, timeout=180, check=False)
+        except FileNotFoundError:
+            continue
+        if proc.returncode == 0:
+            return _folder_picker_result(proc.stdout)
+        if proc.returncode in {1, 255}:
+            return {"cancelled": True}
+    raise ValueError("folder_picker_unavailable: no native folder picker is available")
+
+
+def conversation_context_projection(state: dict[str, Any]) -> dict[str, Any]:
+    plan = state.get("plan") if isinstance(state.get("plan"), dict) else {}
+    plan_context = plan.get("context") if isinstance(plan.get("context"), dict) else {}
+    resources = list(plan_context.get("resources", [])) if isinstance(plan_context.get("resources"), list) else []
+    constraints = list(plan_context.get("constraints", [])) if isinstance(plan_context.get("constraints"), list) else []
+    stored = conversation_context_state(state)
+    constraints.extend(stored["constraints"])
+    try:
+        servers = [
+            {"kind": "mcp", "label": name}
+            for name, cfg in sorted(servers_snapshot().items())
+            if cfg.get("enabled", True)
+        ]
+    except Exception:
+        servers = []
+    if not any(item.get("kind") == "workspace" for item in resources if isinstance(item, dict)):
+        resources.insert(0, {"kind": "workspace", "label": "local-mcp-bridge"})
+    if not any(str(item).startswith("Checkpoint =") for item in constraints):
+        constraints.append(f"Checkpoint = {int(state.get('checkpoint_size', 12))}")
+    sources: list[dict[str, Any]] = []
+    for item in resources:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("kind", "resource"))[:48]
+        label = str(item.get("label", ""))[:200]
+        if not label:
+            continue
+        source = {
+            "id": f"plan-{hashlib.sha256(canonical_json(item).encode('utf-8')).hexdigest()[:24]}",
+            "kind": kind,
+            "label": label,
+            "origin": "plan",
+            "accessible": True,
+            "removable": False,
+        }
+        if isinstance(item.get("ref"), str) and item.get("ref").strip():
+            source["ref"] = item["ref"].strip()[:1000]
+        sources.append(source)
+    sources.extend(refresh_context_source_access(source) for source in stored["sources"])
+    return {
+        "sources": sources,
+        "resources": resources,
+        "constraints": constraints,
+        "servers": servers,
+    }
+
+
 def conversation_public_state(state: dict[str, Any]) -> dict[str, Any]:
     out = dict(state)
-    chain_id = out.get("chain_id")
-    window = int(out.get("checkpoint_window", 0))
+    chain = state.get("active_chain") or {}
+    chain_id = chain.get("chain_id")
+    window = int(chain.get("window", 0))
+    # Derived here and nowhere else. The browser never sends, chooses or
+    # influences this value; it is echoed back for display only.
     out["approval_window_id"] = f"{chain_id}.w{window}" if chain_id else None
+    owner = state.get("owner") or {}
+    out["owner"] = {"expires_at": owner.get("expires_at")} if owner else None
+    out["context"] = conversation_context_projection(state)
     return out
+
+
+class ConversationConflict(ValueError):
+    """Optimistic-concurrency failure. Carries the current state for merge."""
+
+    def __init__(self, state: dict[str, Any]):
+        super().__init__(
+            f"conversation_revision_conflict: expected revision did not match "
+            f"current revision {state.get('revision')}"
+        )
+        self.state = state
+
+
+def _owner_active(state: dict[str, Any], now: float) -> dict[str, Any] | None:
+    owner = state.get("owner")
+    if not isinstance(owner, dict):
+        return None
+    if float(owner.get("expires_at", 0)) <= now:
+        return None
+    return owner
+
+
+# Actions that advance the state machine on the coordinator's behalf. Everything
+# else -- get, configure, enable, disable, stop, context edits -- is a human
+# action and is always allowed.
+OWNER_GUARDED_ACTIONS = {
+    "arm_human_send", "observe_user_turn", "observe_assistant_turn",
+    "assistant_no_task", "register_task", "abandon_task",
+    "task_execution_status", "task_delivery_status", "acknowledge_submission",
+    "request_continue",
+}
+
+
+def _require_owner(state: dict[str, Any], tab_token: Any) -> None:
+    """Two tabs on one conversation are two event pumps against one state machine.
+
+    Serializing inside a tab does not help, so the daemon arbitrates: one tab
+    holds a short renewable lease and only that tab may drive execution. A
+    non-owner tab renders read-only.
+    """
+    now = time.time()
+    owner = _owner_active(state, now)
+    if owner is None:
+        return
+    if not isinstance(tab_token, str) or tab_token != owner.get("tab_token"):
+        raise ValueError(
+            "conversation_not_owner: another tab is driving this conversation"
+        )
+
+
+def _new_chain(state: dict[str, Any], human_turn_id: str) -> None:
+    state["active_chain"] = {
+        "chain_id": secrets.token_hex(16),
+        "human_turn_id": human_turn_id,
+        "window": 0,
+        "window_limit": int(state.get("checkpoint_size", 12)),
+        "window_task_count": 0,
+        "total_task_count": 0,
+        "checkpoint_continue_requested": False,
+    }
+    state["current_task_id"] = None
+    state["current_registration"] = None
+    state["stopped_reason"] = None
 
 
 def update_conversation_state(conversation_id: str, action: str, payload: dict[str, Any]) -> dict[str, Any]:
     conversation_id = validate_conversation_id(conversation_id)
-    if action not in {"get", "enable", "disable", "configure", "human_prompt", "register_task", "task_status", "continue", "stop"}:
+    if action not in CONVERSATION_ACTIONS:
         raise ValueError(f"unsupported conversation state action {action!r}")
+    handler = CONVERSATION_ACTIONS[action]
+
     with conversation_state_lock(conversation_id):
         state = load_conversation_state(conversation_id)
+
         if action == "get":
             return conversation_public_state(state)
-        if action == "enable":
-            state["enabled"] = True
-            state["state"] = "active" if state.get("active") else "enabled"
-        elif action == "disable":
-            state["enabled"] = False
-            state["active"] = False
-            state["state"] = "inactive"
-            state["checkpoint_pending"] = False
-        elif action == "configure":
-            mode = payload.get("mode", state.get("mode", "manual"))
-            if mode not in {"manual", "auto_continue"}:
-                raise ValueError("mode must be manual or auto_continue")
-            checkpoint_size = int(payload.get("checkpoint_size", state.get("checkpoint_size", 12)))
-            if checkpoint_size < 1 or checkpoint_size > 100:
-                raise ValueError("checkpoint_size must be 1..100")
-            state["mode"] = mode
-            state["checkpoint_size"] = checkpoint_size
-        elif action == "human_prompt":
-            anchor = payload.get("anchor")
-            if not isinstance(anchor, str) or not anchor.strip():
-                raise ValueError("human_prompt requires anchor")
-            anchor = anchor.strip()
-            if anchor != state.get("human_anchor"):
-                state["human_anchor"] = anchor
-                state["chain_id"] = secrets.token_hex(16)
-                state["task_count_total"] = 0
-                state["checkpoint_window"] = 0
-                state["window_task_count"] = 0
-                state["checkpoint_pending"] = False
-                state["tasks"] = []
-            if state.get("enabled"):
-                state["active"] = True
-                state["state"] = "active"
-        elif action == "register_task":
-            if not state.get("enabled") or not state.get("active"):
-                raise ValueError("conversation is not active")
-            task_id = payload.get("task_id")
-            if not isinstance(task_id, str) or not task_id.strip():
-                raise ValueError("register_task requires task_id")
-            task_id = task_id.strip()
-            existing = next((item for item in state.get("tasks", []) if item.get("task_id") == task_id), None)
-            if existing is not None:
-                return {**conversation_public_state(state), "registration": "known", "task": existing}
-            if state.get("checkpoint_pending") or state.get("state") in {"checkpoint", "stopped"}:
-                raise ValueError("conversation chain is not accepting new tasks")
-            checkpoint_size = int(state.get("checkpoint_size", 12))
-            position = int(state.get("window_task_count", 0)) + 1
-            if position > checkpoint_size:
-                raise ValueError("checkpoint_required")
-            sequence = int(state.get("task_count_total", 0)) + 1
-            item = {
-                "task_id": task_id,
-                "sequence": sequence,
-                "window": int(state.get("checkpoint_window", 0)),
-                "window_position": position,
-                "title": payload.get("title"),
-                "status": "registered",
-                "updated_at": int(time.time()),
-            }
-            tasks = list(state.get("tasks", []))
-            tasks.append(item)
-            state["tasks"] = tasks[-256:]
-            state["task_count_total"] = sequence
-            state["window_task_count"] = position
-            registration = {"registration": "new", "task": item}
-        elif action == "task_status":
-            task_id = payload.get("task_id")
-            status = payload.get("status")
-            if not isinstance(task_id, str) or not task_id or not isinstance(status, str) or not status:
-                raise ValueError("task_status requires task_id and status")
-            item = next((entry for entry in state.get("tasks", []) if entry.get("task_id") == task_id), None)
-            if item is None:
-                raise ValueError("unknown task_id for conversation")
-            item["status"] = status
-            item["updated_at"] = int(time.time())
-            if status in {"completed", "error", "unknown"} and int(item.get("window_position", 0)) >= int(state.get("checkpoint_size", 12)):
-                state["checkpoint_pending"] = True
-                state["state"] = "checkpoint"
-        elif action == "continue":
-            if not state.get("checkpoint_pending"):
-                raise ValueError("no checkpoint is pending")
-            state["checkpoint_window"] = int(state.get("checkpoint_window", 0)) + 1
-            state["window_task_count"] = 0
-            state["checkpoint_pending"] = False
-            state["state"] = "active"
-        elif action == "stop":
-            state["state"] = "stopped"
+
+        # Compare-and-swap. Every mutating call carries the revision the caller
+        # last saw. This is what makes two tabs safe: the loser's write is
+        # rejected instead of silently double-applying, which is how a single
+        # submission used to be able to advance the checkpoint window twice.
+        expected = payload.get("expected_revision")
+        if expected is not None:
+            if int(expected) != int(state.get("revision", 0)):
+                raise ConversationConflict(conversation_public_state(state))
+
+        # Ownership guards the actions that DRIVE the conversation, never the
+        # ones the human explicitly asks for. Safety against two tabs already
+        # comes from the revision CAS, the journal, and acknowledge_submission
+        # being idempotent on the provider turn id -- the lease is belt and
+        # braces on top of that. Blocking a user's own click on Auto-continue or
+        # Enable bought nothing and locked people out of their own tab.
+        if action in OWNER_GUARDED_ACTIONS:
+            _require_owner(state, payload.get("tab_token"))
+
+        extra = handler(state, payload) or {}
         state = save_conversation_state(state)
         public = conversation_public_state(state)
-        if action == "register_task":
-            public.update(registration)
+        public.update(extra)
         return public
+
+
+# --- Conversation state machine actions --------------------------------------
+
+
+def _act_claim_owner(state: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    tab_token = payload.get("tab_token")
+    if not isinstance(tab_token, str) or not tab_token.strip():
+        raise ValueError("claim_owner requires tab_token")
+    tab_token = tab_token.strip()[:128]
+    now = time.time()
+    owner = _owner_active(state, now)
+    # A page that just loaded IS the live tab, so it claims with takeover. A
+    # periodic renewal does not, so a second live tab cannot ping-pong the lease.
+    # Without takeover, reloading a tab locked the user out for the whole lease.
+    if owner is not None and owner.get("tab_token") != tab_token and not payload.get("takeover"):
+        return {"owner_granted": False, "owner_held": True}
+    state["owner"] = {"tab_token": tab_token, "expires_at": now + OWNER_LEASE_SECONDS}
+    return {"owner_granted": True, "owner_held": False}
+
+
+def _act_release_owner(state: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    owner = state.get("owner") or {}
+    if owner.get("tab_token") == payload.get("tab_token"):
+        state["owner"] = None
+    return {}
+
+
+def _act_configure(state: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    mode = payload.get("mode", state.get("mode", "manual"))
+    if mode not in {"manual", "auto_continue"}:
+        raise ValueError("mode must be manual or auto_continue")
+    checkpoint_size = int(payload.get("checkpoint_size", state.get("checkpoint_size", 12)))
+    if checkpoint_size < 1 or checkpoint_size > 100:
+        raise ValueError("checkpoint_size must be 1..100")
+    state["mode"] = mode
+    state["checkpoint_size"] = checkpoint_size
+    chain = state.get("active_chain")
+    if isinstance(chain, dict):
+        # Never shrink a window the user is already inside; the new limit takes
+        # effect at the next checkpoint.
+        chain["window_limit"] = max(int(chain.get("window_limit", checkpoint_size)), 0) or checkpoint_size
+    return {}
+
+
+def _act_add_context_source(state: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    kind = payload.get("kind", "folder")
+    if kind != "folder":
+        raise ValueError("v0.9.2 context sources support folders only")
+    source = context_source_for_folder(
+        payload.get("path"),
+        payload.get("server"),
+        payload.get("label"),
+    )
+    source["added_at"] = int(time.time())
+
+    context = conversation_context_state(state)
+    existing = context["sources"]
+    updated: list[dict[str, Any]] = []
+    replaced = False
+    for item in existing:
+        if item.get("id") == source["id"]:
+            updated.append({**item, **source, "added_at": int(item.get("added_at", source["added_at"]))})
+            replaced = True
+        else:
+            updated.append(item)
+    if not replaced:
+        if len(updated) >= 64:
+            raise ValueError("conversation context supports at most 64 user-added sources")
+        updated.append(source)
+    state["context"] = {"sources": updated, "constraints": context["constraints"]}
+    return {"context_source": source}
+
+
+def _act_remove_context_source(state: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    source_id = payload.get("source_id") or payload.get("id")
+    if not isinstance(source_id, str) or not source_id.strip():
+        raise ValueError("remove_context_source requires source_id")
+    source_id = source_id.strip()[:80]
+    context = conversation_context_state(state)
+    updated = [source for source in context["sources"] if source.get("id") != source_id]
+    state["context"] = {"sources": updated, "constraints": context["constraints"]}
+    return {"removed": len(updated) != len(context["sources"])}
+
+
+def _act_enable(state: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    state["enabled"] = True
+    state["baseline_at"] = int(time.time())
+    state["pending_human_send"] = False
+    state["active_chain"] = None
+    state["current_task_id"] = None
+    state["current_registration"] = None
+    state["plan"] = None
+    state["outputs"] = []
+    state["stopped_reason"] = None
+    state["phase"] = "idle"
+    return {}
+
+
+def _act_disable(state: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    state["enabled"] = False
+    state["active_chain"] = None
+    state["current_task_id"] = None
+    state["current_registration"] = None
+    state["plan"] = None
+    state["pending_human_send"] = False
+    state["phase"] = "disabled"
+    return {}
+
+
+def _act_workflow_attached(state: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    state["workflow_attached"] = bool(payload.get("attached", True))
+    return {}
+
+
+def _act_arm_human_send(state: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    """The coordinator observed a genuine local send about to happen.
+
+    This only ARMS the daemon. It does not create a chain and does not rotate
+    anything, so a keydown that never becomes a turn costs nothing. The chain is
+    created later, by observe_user_turn, when the provider has actually produced
+    the turn. Scrolling, virtualization and rediscovery can never arm.
+    """
+    if not state.get("enabled"):
+        raise ValueError("conversation is not enabled")
+    state["pending_human_send"] = True
+    return {}
+
+
+def _act_observe_user_turn(state: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    turn_id = payload.get("turn_id")
+    if not isinstance(turn_id, str) or not turn_id.strip():
+        raise ValueError("observe_user_turn requires turn_id")
+    turn_id = turn_id.strip()[:256]
+
+    if turn_id == state.get("last_user_turn_id"):
+        return {"turn": "known"}
+
+    if not state.get("enabled"):
+        state["last_user_turn_id"] = turn_id
+        return {"turn": "ignored_disabled"}
+
+    if not state.get("pending_human_send"):
+        # A user turn we did not arm. Either it is a bridge result turn (handled
+        # by acknowledge_submission), a turn from another tab, or a turn scrolled
+        # into view. None of those may start a chain.
+        state["last_user_turn_id"] = turn_id
+        return {"turn": "unarmed"}
+
+    state["pending_human_send"] = False
+    state["last_user_turn_id"] = turn_id
+    _new_chain(state, turn_id)
+    state["phase"] = "awaiting_assistant"
+    return {"turn": "new_chain"}
+
+
+def _act_observe_assistant_turn(state: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    turn_id = payload.get("turn_id")
+    if not isinstance(turn_id, str) or not turn_id.strip():
+        raise ValueError("observe_assistant_turn requires turn_id")
+    state["last_assistant_turn_id"] = turn_id.strip()[:256]
+    return {}
+
+
+def _act_assistant_no_task(state: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    if state.get("phase") == "awaiting_assistant":
+        state["phase"] = "idle"
+    return {}
+
+
+def _act_request_continue(state: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    chain = state.get("active_chain")
+    if not isinstance(chain, dict) or state.get("phase") != "checkpoint":
+        raise ValueError("no checkpoint is pending")
+    # Requesting continuation does NOT advance the window. The window advances in
+    # acknowledge_submission, only once the provider has actually accepted the
+    # exact stored result -- otherwise a failed submission would mint a fresh
+    # approval window for free.
+    chain["checkpoint_continue_requested"] = True
+    return {}
+
+
+def _act_stop(state: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    state["phase"] = "stopped"
+    reason = payload.get("reason")
+    state["stopped_reason"] = str(reason)[:200] if isinstance(reason, str) and reason.strip() else "stopped_by_user"
+    state["pending_human_send"] = False
+    return {}
+
+
+CONVERSATION_ACTIONS: dict[str, Any] = {
+    "get": None,
+    "claim_owner": _act_claim_owner,
+    "release_owner": _act_release_owner,
+    "configure": _act_configure,
+    "add_context_source": _act_add_context_source,
+    "remove_context_source": _act_remove_context_source,
+    "enable": _act_enable,
+    "disable": _act_disable,
+    "workflow_attached": _act_workflow_attached,
+    "arm_human_send": _act_arm_human_send,
+    "observe_user_turn": _act_observe_user_turn,
+    "observe_assistant_turn": _act_observe_assistant_turn,
+    "assistant_no_task": _act_assistant_no_task,
+    "request_continue": _act_request_continue,
+    "stop": _act_stop,
+}
+
+
+def bind_conversation(provisional_id: str, canonical_id: str) -> dict[str, Any]:
+    """Promote per-tab provisional state to a canonical conversation identity.
+
+    Only provisional state may be migrated, it may be migrated only once, and it
+    may never overwrite existing canonical state. Navigation between two
+    canonical conversations never copies anything.
+    """
+    provisional_id = validate_conversation_id(provisional_id)
+    canonical_id = validate_conversation_id(canonical_id)
+    if not conversation_is_provisional(provisional_id):
+        raise ValueError("bind_conversation source must be a provisional identity")
+    if conversation_is_provisional(canonical_id):
+        raise ValueError("bind_conversation target must be a canonical identity")
+
+    first, second = sorted([provisional_id, canonical_id])
+    with conversation_state_lock(first), conversation_state_lock(second):
+        canonical_path = conversation_state_path(canonical_id)
+        if canonical_path.exists():
+            # Two tabs both started at "/" and both landed here, or this tab
+            # already bound. Fail closed: adopt the existing canonical state.
+            return {**conversation_public_state(load_conversation_state(canonical_id)), "bound": False}
+
+        source = load_conversation_state(provisional_id)
+        migrated = dict(source)
+        migrated["conversation_id"] = canonical_id
+        migrated["revision"] = 0
+        migrated["bound_from_provisional"] = True
+        migrated = save_conversation_state(migrated)
+
+        # Retarget the journals written under the provisional identity so a task
+        # registered before the URL settled is still resolvable afterwards.
+        rebind_task_journals(provisional_id, canonical_id)
+
+        provisional_path = conversation_state_path(provisional_id)
+        try:
+            provisional_path.unlink()
+        except FileNotFoundError:
+            pass
+        return {**conversation_public_state(migrated), "bound": True}
+
+
+# --- Conversation-scoped task journal ----------------------------------------
+#
+# The journal key is SHA256(conversation_id + NUL + task_id). Keying by task_id
+# alone let a model-chosen, low-entropy id ("task1") collide across chats, and
+# because replay resolved before policy evaluation, a collision returned another
+# conversation's stored result with no approval and no policy check. Scoping the
+# key closes the collision; resolving replay AFTER policy re-evaluation closes
+# the bypass.
+#
+# Lifecycle:
+#   registered -> executing -> completed | error | unknown
+#
+# Phase is an explicit field, never inferred from file existence. That
+# distinction is what makes crash recovery deterministic:
+#   registered, no dispatch  -> safe to execute
+#   executing, no result     -> ambiguous, never retried automatically
+#   result present           -> replay without re-entering MCP
+
+
+def journal_key(conversation_id: str, task_id: str) -> str:
+    material = conversation_id.encode("utf-8") + b"\x00" + task_id.encode("utf-8")
+    return hashlib.sha256(material).hexdigest()
+
+
+def journal_path(key: str) -> pathlib.Path:
+    return TASK_DIR / f"{key}.journal.json"
+
+
+def registration_ref_path(registration_id: str) -> pathlib.Path:
+    return TASK_DIR / f"reg-{registration_id}.ref.json"
+
+
+def task_lock(key: str) -> threading.RLock:
+    with TASK_LOCKS_GUARD:
+        return TASK_LOCKS.setdefault(key, threading.RLock())
+
+
+def load_journal(key: str) -> dict[str, Any] | None:
+    try:
+        raw = json.loads(journal_path(key).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
+def save_journal(record: dict[str, Any]) -> dict[str, Any]:
+    record = dict(record)
+    record["updated_at"] = int(time.time())
+    atomic_write_json(journal_path(record["key"]), record)
+    return record
+
+
+def resolve_registration(registration_id: Any) -> dict[str, Any]:
+    if not isinstance(registration_id, str) or not registration_id.strip():
+        raise ValueError("registration is required")
+    registration_id = registration_id.strip()
+    if len(registration_id) != 32 or any(ch not in "0123456789abcdef" for ch in registration_id):
+        raise ValueError("invalid registration handle")
+    try:
+        ref = json.loads(registration_ref_path(registration_id).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise ValueError("unknown registration handle")
+    record = load_journal(ref.get("key", ""))
+    if record is None or record.get("registration_id") != registration_id:
+        raise ValueError("unknown registration handle")
+    return record
+
+
+def rebind_task_journals(provisional_id: str, canonical_id: str) -> None:
+    """Re-key journals written before the provider assigned a conversation id."""
+    for path in list(TASK_DIR.glob("*.journal.json")):
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(record, dict) or record.get("conversation_id") != provisional_id:
+            continue
+        new_key = journal_key(canonical_id, record["task_id"])
+        record["conversation_id"] = canonical_id
+        record["key"] = new_key
+        atomic_write_json(journal_path(new_key), record)
+        atomic_write_json(
+            registration_ref_path(record["registration_id"]),
+            {"key": new_key, "conversation_id": canonical_id, "task_id": record["task_id"]},
+        )
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _act_register_task(state: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    """Register the current assistant task and return an opaque handle.
+
+    The full task is normalized and persisted HERE, once. Preview, approval and
+    execution then refer to the handle, so the browser cannot resupply or mutate
+    task content between phases.
+
+    Registration is idempotent on (assistant_turn_id, digest) in ANY phase. The
+    phase gate applies to CREATING a registration, never to resolving one --
+    otherwise a reload during task_registered would rediscover its own task and
+    be refused with no way back.
+    """
+    if not state.get("enabled"):
+        raise ValueError("conversation is not enabled")
+    chain = state.get("active_chain")
+    if not isinstance(chain, dict):
+        raise ValueError("no active chain; a task can only be registered after a genuine human turn")
+    if state.get("phase") == "stopped":
+        raise ValueError("conversation chain is stopped")
+
+    assistant_turn_id = payload.get("assistant_turn_id")
+    if not isinstance(assistant_turn_id, str) or not assistant_turn_id.strip():
+        raise ValueError("register_task requires assistant_turn_id")
+    assistant_turn_id = assistant_turn_id.strip()[:256]
+
+    task = normalize_task(payload.get("task"))
+    conversation_id = state["conversation_id"]
+    key = journal_key(conversation_id, task["id"])
+    digest = task_digest(task)
+
+    with task_lock(key):
+        existing = load_journal(key)
+        if existing is not None:
+            if existing.get("digest") != digest:
+                raise ValueError(
+                    f"task id {task['id']!r} already exists in this conversation with different "
+                    "content; use a new task id"
+                )
+            if existing.get("assistant_turn_id") != assistant_turn_id:
+                raise ValueError(
+                    f"task id {task['id']!r} is registered against a different assistant turn"
+                )
+            return {"registration": "known", "task": _journal_public(existing)}
+
+        # Creating a new registration requires the awaiting-assistant phase --
+        # unless the phase is held open by a registration that never dispatched
+        # and has gone stale, in which case that one is released first.
+        if state.get("phase") != "awaiting_assistant":
+            superseded = _maybe_release_stale_registration(state)
+            if not superseded:
+                raise ValueError(
+                    f"conversation phase {state.get('phase')!r} does not accept a new task registration"
+                )
+
+        window_limit = int(chain.get("window_limit", state.get("checkpoint_size", 12)))
+        if int(chain.get("window_task_count", 0)) >= window_limit:
+            # Window exhaustion and checkpoint-pending are the same condition,
+            # derived from one number. Setting the phase here means a chain can
+            # never reach a state where registration is refused for capacity but
+            # request_continue is refused for having no pending checkpoint.
+            state["phase"] = "checkpoint"
+            raise ValueError("checkpoint_required")
+
+        _register_plan_if_needed(state, task, chain)
+
+        position = int(chain.get("window_task_count", 0)) + 1
+        sequence = int(chain.get("total_task_count", 0)) + 1
+        registration_id = secrets.token_hex(16)
+        record = {
+            "key": key,
+            "registration_id": registration_id,
+            "conversation_id": conversation_id,
+            "task_id": task["id"],
+            "assistant_turn_id": assistant_turn_id,
+            "digest": digest,
+            "task": task,
+            "title": task.get("title"),
+            "chain_id": chain.get("chain_id"),
+            "window": int(chain.get("window", 0)),
+            "window_position": position,
+            "sequence": sequence,
+            "plan_id": task.get("plan_id") or (task.get("plan") or {}).get("id"),
+            "plan_revision": task.get("plan_revision") or (task.get("plan") or {}).get("revision"),
+            "plan_item_id": task.get("plan_item_id"),
+            "outputs": task.get("outputs", []),
+            "execution_status": "registered",
+            "delivery_status": "none",
+            "dispatched_at": None,
+            "result": None,
+            "created_at": int(time.time()),
+        }
+        record = save_journal(record)
+        atomic_write_json(
+            registration_ref_path(registration_id),
+            {"key": key, "conversation_id": conversation_id, "task_id": task["id"]},
+        )
+
+    chain["window_task_count"] = position
+    chain["total_task_count"] = sequence
+    state["current_task_id"] = task["id"]
+    state["current_registration"] = registration_id
+    state["phase"] = "task_registered"
+    _mark_plan_item_current(state, record)
+    _upsert_outputs(state, record, "pending")
+    _project_recent_task(state, record)
+    return {"registration": "new", "task": _journal_public(record)}
+
+
+def _maybe_release_stale_registration(state: dict[str, Any]) -> bool:
+    if state.get("phase") not in {"task_registered", "result_ready"}:
+        return False
+    registration_id = state.get("current_registration")
+    if not registration_id:
+        state["phase"] = "awaiting_assistant"
+        return True
+    try:
+        record = resolve_registration(registration_id)
+    except ValueError:
+        state["current_registration"] = None
+        state["current_task_id"] = None
+        state["phase"] = "awaiting_assistant"
+        return True
+    if record.get("execution_status") != "registered":
+        return False
+    if int(time.time()) - int(record.get("created_at", 0)) < REGISTRATION_STALE_SECONDS:
+        return False
+    _release_registration(state, record, "superseded_stale_registration")
+    state["phase"] = "awaiting_assistant"
+    return True
+
+
+def _journal_public(record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "registration_id": record.get("registration_id"),
+        "task_id": record.get("task_id"),
+        "title": record.get("title"),
+        "sequence": record.get("sequence"),
+        "window": record.get("window"),
+        "window_position": record.get("window_position"),
+        "plan_id": record.get("plan_id"),
+        "plan_revision": record.get("plan_revision"),
+        "plan_item_id": record.get("plan_item_id"),
+        "outputs": record.get("outputs", []),
+        "execution_status": record.get("execution_status"),
+        "delivery_status": record.get("delivery_status"),
+        # Surfaced so the sidebar can show a completion time on a finished step,
+        # as the approved reference does ("Completed - 14:02:11").
+        "updated_at": record.get("updated_at"),
+    }
+
+
+def _project_recent_task(state: dict[str, Any], record: dict[str, Any]) -> None:
+    """recent_tasks is a bounded DISPLAY projection.
+
+    Nothing may decide staleness, currentness or duplicate-id questions from it;
+    those all resolve against the journal, which is never truncated. Keeping this
+    list bounded is therefore safe.
+    """
+    entry = _journal_public(record)
+    tasks = [item for item in state.get("recent_tasks", []) if item.get("task_id") != entry["task_id"]]
+    tasks.append(entry)
+    tasks.sort(key=lambda item: int(item.get("sequence") or 0))
+    state["recent_tasks"] = tasks[-MAX_RECENT_TASKS:]
+
+
+def _plan_item_index(plan: dict[str, Any], item_id: str) -> int | None:
+    for index, item in enumerate(plan.get("items", [])):
+        if item.get("id") == item_id:
+            return index
+    return None
+
+
+def _next_plan_item_id(plan: dict[str, Any]) -> str | None:
+    for item in plan.get("items", []):
+        if item.get("status", "pending") in {"pending", "current"}:
+            return item.get("id")
+    return None
+
+
+def _register_plan_if_needed(state: dict[str, Any], task: dict[str, Any], chain: dict[str, Any]) -> None:
+    supplied_plan = task.get("plan")
+    existing = state.get("plan")
+    plan_item_id = task.get("plan_item_id")
+    if supplied_plan is not None:
+        if not plan_item_id:
+            raise ValueError("task.plan_item_id is required when task.plan is supplied")
+        if task.get("plan_id") and task.get("plan_id") != supplied_plan.get("id"):
+            raise ValueError("task.plan_id does not match task.plan.id")
+        if task.get("plan_revision") is not None and int(task.get("plan_revision")) != int(supplied_plan.get("revision", 0)):
+            raise ValueError("task.plan_revision does not match task.plan.revision")
+        # A plan is immutable once registered FOR A CHAIN, which is what the
+        # protocol document says. A genuine human turn starts a new chain, and
+        # that chain may carry its own plan -- without this, the first plan in a
+        # conversation permanently blocks every later one: a new plan raises
+        # "immutable after execution has begun" and the old plan's items raise
+        # "superseded chain", so the plan feature wedges after one use.
+        if isinstance(existing, dict) and existing.get("chain_id") != chain.get("chain_id"):
+            existing = None
+        if isinstance(existing, dict) and existing.get("begun"):
+            raise ValueError("plan is immutable after execution has begun")
+        if existing is None:
+            state["plan"] = {
+                **supplied_plan,
+                "begun": True,
+                "chain_id": chain.get("chain_id"),
+                "created_at": int(time.time()),
+            }
+            existing = state["plan"]
+
+    plan = state.get("plan")
+    if not plan_item_id:
+        if task.get("plan_id") or task.get("plan_revision") is not None:
+            raise ValueError("task.plan_item_id is required when referencing a plan")
+        return
+    if not isinstance(plan, dict):
+        raise ValueError("task references a plan but no plan is registered for this conversation")
+    if task.get("plan_id") and task.get("plan_id") != plan.get("id"):
+        raise ValueError("task.plan_id does not match the registered plan")
+    if task.get("plan_revision") is not None and int(task.get("plan_revision")) != int(plan.get("revision", 0)):
+        raise ValueError("task.plan_revision does not match the registered plan")
+    if plan.get("chain_id") != chain.get("chain_id"):
+        raise ValueError("historical plan item belongs to a superseded chain")
+
+    index = _plan_item_index(plan, plan_item_id)
+    if index is None:
+        raise ValueError(f"task.plan_item_id {plan_item_id!r} does not exist in the registered plan")
+    item = plan["items"][index]
+    if item.get("status") in {"completed", "error", "unknown", "skipped"}:
+        raise ValueError(f"plan item {plan_item_id!r} has already finished")
+    expected = _next_plan_item_id(plan)
+    if expected != plan_item_id:
+        raise ValueError(f"plan order violation: expected plan item {expected!r}, got {plan_item_id!r}")
+
+
+def _mark_plan_item_current(state: dict[str, Any], record: dict[str, Any]) -> None:
+    plan_item_id = record.get("plan_item_id")
+    plan = state.get("plan")
+    if not plan_item_id or not isinstance(plan, dict):
+        return
+    index = _plan_item_index(plan, plan_item_id)
+    if index is None:
+        return
+    for item in plan.get("items", []):
+        if item.get("status") == "current" and item.get("id") != plan_item_id:
+            item["status"] = "pending"
+    item = plan["items"][index]
+    item["status"] = "current"
+    item["task_id"] = record.get("task_id")
+    item["registration_id"] = record.get("registration_id")
+    item["sequence"] = record.get("sequence")
+    item["window"] = record.get("window")
+    item["window_position"] = record.get("window_position")
+
+
+def _mark_plan_item_from_record(state: dict[str, Any], record: dict[str, Any], status: str) -> None:
+    plan_item_id = record.get("plan_item_id")
+    plan = state.get("plan")
+    if not plan_item_id or not isinstance(plan, dict):
+        return
+    index = _plan_item_index(plan, plan_item_id)
+    if index is None:
+        return
+    if status not in PLAN_ITEM_STATUSES:
+        return
+    plan["items"][index]["status"] = status
+    if status in {"error", "unknown", "skipped"}:
+        plan["items"][index]["finished_reason"] = record.get("abandoned_reason") or record.get("execution_status")
+
+
+def _upsert_outputs(state: dict[str, Any], record: dict[str, Any], status: str) -> None:
+    if status not in OUTPUT_STATUSES:
+        return
+    declared = record.get("outputs")
+    if not isinstance(declared, list):
+        return
+    existing = {
+        item.get("id"): dict(item)
+        for item in state.get("outputs", [])
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    for output in declared:
+        if not isinstance(output, dict):
+            continue
+        entry = {**output, "status": status, "task_id": record.get("task_id")}
+        entry["updated_at"] = int(time.time())
+        existing[entry["id"]] = entry
+    state["outputs"] = list(existing.values())[-128:]
+
+
+def _act_task_execution_status(state: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    record = resolve_registration(payload.get("registration"))
+    if record.get("conversation_id") != state["conversation_id"]:
+        raise ValueError("registration does not belong to this conversation")
+    status = payload.get("status")
+    if status not in EXECUTION_STATUSES:
+        raise ValueError(f"execution status must be one of {sorted(EXECUTION_STATUSES)}")
+
+    with task_lock(record["key"]):
+        record = load_journal(record["key"]) or record
+        record["execution_status"] = status
+        record = save_journal(record)
+
+    _project_recent_task(state, record)
+    if status == "running":
+        _mark_plan_item_from_record(state, record, "current")
+    elif status == "completed":
+        _mark_plan_item_from_record(state, record, "completed")
+        _upsert_outputs(state, record, "produced")
+    elif status == "error":
+        _mark_plan_item_from_record(state, record, "error")
+        _upsert_outputs(state, record, "failed")
+    elif status == "unknown":
+        _mark_plan_item_from_record(state, record, "unknown")
+        _upsert_outputs(state, record, "unknown")
+    chain = state.get("active_chain")
+    if status == "running":
+        state["phase"] = "executing"
+        return {}
+    if status == "unknown":
+        # An ambiguous mutation never waits at a checkpoint and never continues.
+        state["phase"] = "stopped"
+        state["stopped_reason"] = "unknown_mutation_state"
+        return {}
+    if status in {"completed", "error"} and isinstance(chain, dict):
+        window_limit = int(chain.get("window_limit", state.get("checkpoint_size", 12)))
+        if int(record.get("window_position", 0)) >= window_limit:
+            state["phase"] = "checkpoint"
+        else:
+            state["phase"] = "result_ready"
+    return {}
+
+
+def _act_task_delivery_status(state: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    record = resolve_registration(payload.get("registration"))
+    if record.get("conversation_id") != state["conversation_id"]:
+        raise ValueError("registration does not belong to this conversation")
+    status = payload.get("status")
+    if status not in DELIVERY_STATUSES:
+        raise ValueError(f"delivery status must be one of {sorted(DELIVERY_STATUSES)}")
+    if status == "submitted":
+        raise ValueError("submitted delivery is recorded only by acknowledge_submission")
+    with task_lock(record["key"]):
+        record = load_journal(record["key"]) or record
+        record["delivery_status"] = status
+        record = save_journal(record)
+    _project_recent_task(state, record)
+    return {}
+
+
+def _act_acknowledge_submission(state: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    """The provider actually accepted the bridge result as a new user turn.
+
+    Verified against the daemon's own stored canonical result -- matching only
+    task_id is not sufficient. Idempotent on the provider turn id, so a repeated
+    acknowledgement (retry, second tab) cannot advance the checkpoint window
+    twice for one submission.
+    """
+    record = resolve_registration(payload.get("registration"))
+    if record.get("conversation_id") != state["conversation_id"]:
+        raise ValueError("registration does not belong to this conversation")
+
+    turn_id = payload.get("turn_id")
+    if not isinstance(turn_id, str) or not turn_id.strip():
+        raise ValueError("acknowledge_submission requires the provider turn_id")
+    turn_id = turn_id.strip()[:256]
+
+    submitted = payload.get("result")
+    stored = record.get("result")
+    if not isinstance(stored, dict):
+        raise ValueError("no stored result for this registration")
+    if canonical_json(submitted) != canonical_json(stored):
+        raise ValueError("submitted result does not match the stored canonical result")
+
+    if record.get("delivery_status") == "submitted" and record.get("submitted_turn_id") == turn_id:
+        return {"acknowledged": "known"}
+
+    with task_lock(record["key"]):
+        record = load_journal(record["key"]) or record
+        already = record.get("delivery_status") == "submitted"
+        record["delivery_status"] = "submitted"
+        record.setdefault("submitted_turn_id", turn_id)
+        record = save_journal(record)
+
+    _project_recent_task(state, record)
+    state["last_user_turn_id"] = turn_id
+    if already:
+        return {"acknowledged": "known"}
+
+    chain = state.get("active_chain")
+    if isinstance(chain, dict) and chain.get("checkpoint_continue_requested"):
+        chain["window"] = int(chain.get("window", 0)) + 1
+        chain["window_task_count"] = 0
+        chain["window_limit"] = int(state.get("checkpoint_size", 12))
+        chain["checkpoint_continue_requested"] = False
+        # The approval window id is derived from chain_id + window, so advancing
+        # the window necessarily invalidates the previous window's chain lease.
+        evict_superseded_chain_leases(chain.get("chain_id"), int(chain["window"]))
+
+    if state.get("phase") != "stopped":
+        state["phase"] = "awaiting_assistant"
+    return {"acknowledged": "new"}
+
+
+def _release_registration(state: dict[str, Any], record: dict[str, Any], reason: str) -> dict[str, Any]:
+    """Release a registered-but-never-dispatched task and free its window slot.
+
+    Only safe for a task that never dispatched. A task that reached `executing`
+    keeps its slot and its ambiguity: it may have changed something.
+    """
+    with task_lock(record["key"]):
+        current = load_journal(record["key"]) or record
+        if current.get("execution_status") == "registered":
+            current["execution_status"] = "error"
+            current["abandoned_reason"] = reason
+            current = save_journal(current)
+            freed = True
+        else:
+            freed = False
+    chain = state.get("active_chain")
+    if freed and isinstance(chain, dict) and int(current.get("window", -1)) == int(chain.get("window", 0)):
+        chain["window_task_count"] = max(0, int(chain.get("window_task_count", 0)) - 1)
+        chain["total_task_count"] = max(0, int(chain.get("total_task_count", 0)) - 1)
+    _project_recent_task(state, current)
+    _mark_plan_item_from_record(state, current, "skipped")
+    _upsert_outputs(state, current, "failed")
+    if state.get("current_registration") == current.get("registration_id"):
+        state["current_registration"] = None
+        state["current_task_id"] = None
+    return current
+
+
+def _act_abandon_task(state: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    """The current task will not run: denied at the approval dialog, or failed
+    before dispatch. Without this the chain would sit in task_registered forever
+    -- registration refused for phase, continuation refused for having no
+    checkpoint. Releasing it returns the chain to a usable state.
+    """
+    record = resolve_registration(payload.get("registration"))
+    if record.get("conversation_id") != state["conversation_id"]:
+        raise ValueError("registration does not belong to this conversation")
+    reason = payload.get("reason")
+    reason = str(reason)[:120] if isinstance(reason, str) and reason.strip() else "abandoned"
+    released = _release_registration(state, record, reason)
+    if state.get("phase") in {"task_registered", "result_ready"}:
+        chain = state.get("active_chain")
+        window_limit = int((chain or {}).get("window_limit", state.get("checkpoint_size", 12)))
+        if isinstance(chain, dict) and int(chain.get("window_task_count", 0)) >= window_limit:
+            state["phase"] = "checkpoint"
+        else:
+            state["phase"] = "awaiting_assistant"
+    return {"abandoned": released.get("execution_status")}
+
+
+CONVERSATION_ACTIONS.update({
+    "register_task": _act_register_task,
+    "abandon_task": _act_abandon_task,
+    "task_execution_status": _act_task_execution_status,
+    "task_delivery_status": _act_task_delivery_status,
+    "acknowledge_submission": _act_acknowledge_submission,
+})
 
 
 def registry_version(servers: dict[str, dict[str, Any]] | None = None) -> str:
@@ -446,6 +1596,8 @@ ensure_state_permissions()
 TOKEN = load_token()
 SERVERS = load_servers()
 SERVERS_LOCK = threading.RLock()
+TOOL_CATALOG_GUARD = threading.RLock()
+TOOL_CATALOG_FINGERPRINTS: dict[str, str] = {}
 TASK_LOCKS_GUARD = threading.RLock()
 TASK_LOCKS: dict[str, threading.RLock] = {}
 CONVERSATION_LOCKS_GUARD = threading.RLock()
@@ -655,8 +1807,20 @@ class McpHttpClient:
         headers = self._headers(include_protocol=include_protocol)
         headers["Content-Type"] = "application/json"
         conn = http.client.HTTPConnection(self.parsed.hostname, self.parsed.port, timeout=self.timeout)
+        # Whether the request actually reached the server decides whether a failed
+        # mutating call is a clean 'error' or an ambiguous 'unknown'. Only a
+        # failure to establish the connection is provably pre-dispatch; anything
+        # from the write onward is treated as dispatched.
+        dispatched = False
         try:
-            conn.request("POST", self._path(), body=body, headers=headers)
+            try:
+                conn.request("POST", self._path(), body=body, headers=headers)
+            except (ConnectionRefusedError, socket.gaierror):
+                raise
+            except Exception:
+                dispatched = True
+                raise
+            dispatched = True
             response = conn.getresponse()
             raw = response.read(MAX_MCP_BODY + 1)
             if len(raw) > MAX_MCP_BODY:
@@ -680,6 +1844,9 @@ class McpHttpClient:
             if not isinstance(payload, dict):
                 raise ValueError(f"MCP {self.name} returned a non-object JSON response")
             return payload
+        except Exception as exc:
+            setattr(exc, "lbp_dispatched", dispatched)
+            raise
         finally:
             conn.close()
             self.last_used = time.time()
@@ -743,18 +1910,35 @@ class McpHttpClient:
         }, expected_id=request_id, include_protocol=True)
         return self._validate_response(payload, request_id, method)
 
-    def _rpc(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+    def _rpc(self, method: str, params: dict[str, Any], *, allow_session_retry: bool = True) -> dict[str, Any]:
         try:
             return self._rpc_once(method, params)
         except McpHttpError as exc:
             if exc.status != 404 or not self.session_id:
                 raise
+            if not allow_session_retry:
+                # The request reached the server before it answered 404. A server
+                # that expired the session AFTER applying a mutation would get the
+                # mutation applied twice. Never silently re-dispatch a mutating
+                # call; surface it as ambiguous instead.
+                self.reset_session()
+                raise
             self.reset_session()
             return self._rpc_once(method, params)
 
-    def call_tool(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    def call_tool(
+        self,
+        tool: str,
+        arguments: dict[str, Any],
+        *,
+        allow_session_retry: bool = True,
+    ) -> dict[str, Any]:
         with self.lock:
-            return self._rpc("tools/call", {"name": tool, "arguments": arguments})
+            return self._rpc(
+                "tools/call",
+                {"name": tool, "arguments": arguments},
+                allow_session_retry=allow_session_retry,
+            )
 
     def list_tools(self, *, refresh: bool = False) -> dict[str, Any]:
         with self.lock:
@@ -957,6 +2141,28 @@ def is_freeform_text_key(key: str) -> bool:
     return key.lower() in FREEFORM_TEXT_KEYS
 
 
+def is_traversal_shaped(value: str) -> bool:
+    """A relative value that is trying to reach outside a working directory.
+
+    Explicit path keys already fail closed on any relative value. This covers the
+    other half: a tool whose path argument is named something the key heuristic
+    does not recognize -- `file`, `filename`, `target`, `dest`, `output` -- where
+    only absolute values used to be checked, so `../../../.ssh/id_rsa` escaped
+    the root boundary entirely.
+
+    Deliberately narrow: it matches traversal and explicit relative-path shapes,
+    not every string that happens to contain a slash, so ordinary values like
+    "feature/x" or "hello/world" are unaffected.
+    """
+    text = value.strip()
+    if not text:
+        return False
+    if text.startswith(("./", "../", "~/", "~\\", ".\\", "..\\")):
+        return True
+    parts = text.replace("\\", "/").split("/")
+    return any(part == ".." for part in parts)
+
+
 def values_from_path_field(value: Any) -> Iterable[str]:
     if isinstance(value, str) and value.strip():
         yield value
@@ -1008,7 +2214,9 @@ def collect_path_arguments(
     elif isinstance(value, str) and value.strip():
         raw = value.strip()
         expanded = pathlib.Path(raw).expanduser()
-        if path_key_context or (detect_path_by_value and expanded.is_absolute()):
+        if path_key_context:
+            found.append((prefix or "<argument>", raw))
+        elif detect_path_by_value and (expanded.is_absolute() or is_traversal_shaped(raw)):
             found.append((prefix or "<argument>", raw))
     return found
 
@@ -1099,19 +2307,19 @@ def validate_browser_session_id(value: Any) -> str | None:
     return value
 
 
-def validate_chain_id(value: Any) -> str | None:
-    if value is None or value == "":
-        return None
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError("chain id must be a non-empty string")
-    value = value.strip()
-    if len(value) > 128 or any(not (ch.isalnum() or ch in "._-") for ch in value):
-        raise ValueError("chain id contains invalid characters")
-    return value
-
-
 def policy_fingerprint(server: str, cfg: dict[str, Any]) -> str:
-    material = {"server": server, "config": cfg}
+    """Bind an approval to the policy AND to the tool classifications it assumed.
+
+    Classification is derived from annotations the MCP server publishes, and the
+    catalog is re-fetched at preflight. Without the catalog in the fingerprint, a
+    server that relabels a tool from destructive to read-only between grant and
+    use would not invalidate a live lease.
+    """
+    material = {
+        "server": server,
+        "config": cfg,
+        "catalog": TOOL_CATALOG_FINGERPRINTS.get(server),
+    }
     return hashlib.sha256(canonical_json(material).encode("utf-8")).hexdigest()
 
 
@@ -1130,35 +2338,47 @@ def cleanup_approval_state() -> None:
 
 
 def session_lease_covers(
-    session_id: str | None,
+    conversation_id: str | None,
     server: str,
     classification: str,
     cfg: dict[str, Any],
 ) -> bool:
-    if not session_id:
+    """Session leases are bound to (conversation_id, server).
+
+    They are deliberately NOT keyed on the browser session id: a lease must not
+    follow the user from one conversation into another, and the browser must not
+    be able to widen a lease's reach by choosing its own session identifier.
+    """
+    if not conversation_id:
         return False
     cleanup_approval_state()
     with APPROVAL_LOCK:
-        lease = SESSION_LEASES.get((session_id, server))
+        lease = SESSION_LEASES.get((conversation_id, server))
         if not lease:
             return False
         if lease.get("policy_fingerprint") != policy_fingerprint(server, cfg):
-            SESSION_LEASES.pop((session_id, server), None)
+            SESSION_LEASES.pop((conversation_id, server), None)
             return False
         return int(lease.get("max_risk", -1)) >= RISK_RANK.get(classification, 99)
 
 
 def chain_lease_covers(
-    session_id: str | None,
-    chain_id: str | None,
+    conversation_id: str | None,
+    window_id: str | None,
     server: str,
     classification: str,
     cfg: dict[str, Any],
 ) -> bool:
-    if not session_id or not chain_id:
+    """"Allow this chain" means the current checkpoint window and nothing wider.
+
+    window_id is derived by the daemon as chain_id + ".w" + window and is never
+    accepted from the browser, so advancing a checkpoint necessarily creates a
+    fresh approval scope and a new human turn necessarily abandons the old one.
+    """
+    if not conversation_id or not window_id:
         return False
     cleanup_approval_state()
-    key = (session_id, chain_id, server)
+    key = (conversation_id, window_id, server)
     with APPROVAL_LOCK:
         lease = CHAIN_LEASES.get(key)
         if not lease:
@@ -1173,8 +2393,8 @@ def approval_decision(
     server: str,
     classification: str,
     cfg: dict[str, Any],
-    session_id: str | None,
-    chain_id: str | None = None,
+    conversation_id: str | None,
+    window_id: str | None = None,
 ) -> dict[str, Any]:
     mode = cfg.get("approval_mode", "mutations")
     escalation = cfg.get("approval_escalation", "chain")
@@ -1190,7 +2410,7 @@ def approval_decision(
             "session_approval_available": False,
         }
 
-    if session_lease_covers(session_id, server, classification, cfg):
+    if session_lease_covers(conversation_id, server, classification, cfg):
         return {
             "required": False,
             "reason": "session_lease",
@@ -1200,7 +2420,7 @@ def approval_decision(
             "session_approval_available": False,
         }
 
-    if chain_lease_covers(session_id, chain_id, server, classification, cfg):
+    if chain_lease_covers(conversation_id, window_id, server, classification, cfg):
         return {
             "required": False,
             "reason": "chain_lease",
@@ -1210,8 +2430,8 @@ def approval_decision(
             "session_approval_available": False,
         }
 
-    chain_available = bool(session_id and chain_id and escalation in {"chain", "session"})
-    session_available = bool(session_id and (mode == "session" or escalation == "session"))
+    chain_available = bool(conversation_id and window_id and escalation in {"chain", "session"})
+    session_available = bool(conversation_id and (mode == "session" or escalation == "session"))
 
     if mode == "none":
         return {
@@ -1265,11 +2485,11 @@ def grant_approval(
     raw_task: Any,
     session_id: str | None,
     decision: str,
-    chain_id: str | None = None,
+    window_id: str | None = None,
+    conversation_id: str | None = None,
 ) -> dict[str, Any]:
     session_id = validate_browser_session_id(session_id)
-    chain_id = validate_chain_id(chain_id)
-    task, preview = preflight_task(raw_task, session_id, chain_id)
+    task, preview = preflight_task(raw_task, session_id, window_id, conversation_id)
     approval = preview["approval"]
     if not approval.get("required"):
         return {
@@ -1290,18 +2510,18 @@ def grant_approval(
     cfg = get_server_config(server)
 
     if decision == "chain":
-        assert session_id is not None and chain_id is not None
+        assert conversation_id is not None and window_id is not None
         with APPROVAL_LOCK:
-            CHAIN_LEASES[(session_id, chain_id, server)] = {
+            CHAIN_LEASES[(conversation_id, window_id, server)] = {
                 "max_risk": RISK_RANK[op["classification"]],
                 "policy_fingerprint": policy_fingerprint(server, cfg),
                 "expires_at": time.time() + SESSION_LEASE_TTL_SECONDS,
             }
 
     if decision == "session":
-        assert session_id is not None
+        assert conversation_id is not None
         with APPROVAL_LOCK:
-            SESSION_LEASES[(session_id, server)] = {
+            SESSION_LEASES[(conversation_id, server)] = {
                 "max_risk": RISK_RANK[op["classification"]],
                 "policy_fingerprint": policy_fingerprint(server, cfg),
                 "expires_at": time.time() + SESSION_LEASE_TTL_SECONDS,
@@ -1370,6 +2590,113 @@ def validate_task_text(value: Any, field: str, max_len: int) -> str | None:
     if len(value) > max_len:
         raise ValueError(f"task.{field} exceeds {max_len} characters")
     return value
+
+
+def validate_metadata_id(value: Any, field: str, max_len: int = 128) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field} must be a non-empty string")
+    value = value.strip()
+    if len(value) > max_len:
+        raise ValueError(f"{field} must be <= {max_len} characters")
+    return value
+
+
+def normalize_plan_context(raw: Any) -> dict[str, Any]:
+    if raw is None:
+        return {"resources": [], "constraints": []}
+    if not isinstance(raw, dict):
+        raise ValueError("plan.context must be a JSON object")
+    resources_raw = raw.get("resources", [])
+    constraints_raw = raw.get("constraints", [])
+    if not isinstance(resources_raw, list) or len(resources_raw) > 64:
+        raise ValueError("plan.context.resources must be an array with at most 64 items")
+    if not isinstance(constraints_raw, list) or len(constraints_raw) > 64:
+        raise ValueError("plan.context.constraints must be an array with at most 64 items")
+    resources: list[dict[str, str]] = []
+    for index, item in enumerate(resources_raw):
+        if not isinstance(item, dict):
+            raise ValueError(f"plan.context.resources[{index}] must be an object")
+        kind = validate_metadata_id(item.get("kind", "resource"), f"plan.context.resources[{index}].kind", 48)
+        label = validate_metadata_id(item.get("label"), f"plan.context.resources[{index}].label", 200)
+        resource = {"kind": kind, "label": label}
+        ref = item.get("ref")
+        if isinstance(ref, str) and ref.strip():
+            resource["ref"] = ref.strip()[:1000]
+        resources.append(resource)
+    constraints = [
+        item.strip()[:300]
+        for item in constraints_raw
+        if isinstance(item, str) and item.strip()
+    ]
+    if len(constraints) != len(constraints_raw):
+        raise ValueError("plan.context.constraints must contain only non-empty strings")
+    return {"resources": resources, "constraints": constraints}
+
+
+def normalize_plan(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise ValueError("task.plan must be a JSON object")
+    plan_id = validate_metadata_id(raw.get("id"), "plan.id")
+    try:
+        revision = int(raw.get("revision"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("plan.revision must be an integer") from exc
+    if revision < 1:
+        raise ValueError("plan.revision must be >= 1")
+    title = validate_task_text(raw.get("title"), "plan.title", 200)
+    items_raw = raw.get("items")
+    if not isinstance(items_raw, list) or not items_raw or len(items_raw) > 100:
+        raise ValueError("plan.items must contain 1..100 items")
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(items_raw):
+        if not isinstance(item, dict):
+            raise ValueError(f"plan.items[{index}] must be an object")
+        item_id = validate_metadata_id(item.get("id"), f"plan.items[{index}].id")
+        if item_id in seen:
+            raise ValueError(f"plan item id {item_id!r} is not unique")
+        seen.add(item_id)
+        phase = validate_task_text(item.get("phase"), f"plan.items[{index}].phase", 80) or "execute"
+        item_title = validate_task_text(item.get("title"), f"plan.items[{index}].title", 200)
+        if not item_title:
+            raise ValueError(f"plan.items[{index}].title must be a non-empty string")
+        items.append({
+            "id": item_id,
+            "phase": phase,
+            "title": item_title,
+            "status": "pending",
+        })
+    return {
+        "id": plan_id,
+        "revision": revision,
+        "title": title or plan_id,
+        "items": items,
+        "context": normalize_plan_context(raw.get("context")),
+    }
+
+
+def normalize_outputs(raw: Any) -> list[dict[str, Any]]:
+    if raw is None:
+        return []
+    if not isinstance(raw, list) or len(raw) > 64:
+        raise ValueError("task.outputs must be an array with at most 64 items")
+    outputs: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise ValueError(f"task.outputs[{index}] must be an object")
+        output_id = validate_metadata_id(item.get("id"), f"task.outputs[{index}].id")
+        if output_id in seen:
+            raise ValueError(f"task.outputs id {output_id!r} is not unique")
+        seen.add(output_id)
+        label = validate_metadata_id(item.get("label"), f"task.outputs[{index}].label", 200)
+        kind = validate_metadata_id(item.get("kind"), f"task.outputs[{index}].kind", 80)
+        output = {"id": output_id, "label": label, "kind": kind}
+        ref = item.get("ref")
+        if isinstance(ref, str) and ref.strip():
+            output["ref"] = ref.strip()[:1000]
+        outputs.append(output)
+    return outputs
 
 
 MAX_MUTATE_CALLS = 8
@@ -1449,13 +2776,16 @@ def normalize_task(raw: Any) -> dict[str, Any]:
     protocol = raw.get("protocol")
     if protocol != "lbp":
         raise ValueError("task.protocol must be 'lbp'")
+    # v0.9.2 protocol freeze: runtime support is LBP 1.3 plus backward-compatible
+    # 1.2 only. LBP 1.1 is a historical document, never a runtime target -- it is
+    # rejected here rather than silently coerced so the daemon is never more
+    # permissive than the extension validator.
     raw_version = raw.get("version")
-    if raw_version in {"1.1", 1, "1"}:
-        task_version = "1.2"
-    else:
-        task_version = str(raw_version)
+    task_version = "1.2" if raw_version is None else str(raw_version)
     if task_version not in SUPPORTED_LBP_TASK_VERSIONS:
-        raise ValueError("task.version must be '1.2' or '1.3'")
+        raise ValueError(
+            "task.version must be '1.2' or '1.3'; LBP 1.1 is historical and is not a runtime target"
+        )
     task_id = raw.get("id")
     if not isinstance(task_id, str) or not task_id.strip():
         raise ValueError("task.id must be a non-empty string")
@@ -1464,6 +2794,8 @@ def normalize_task(raw: Any) -> dict[str, Any]:
 
     operation = raw.get("operation")
     if operation is None and isinstance(raw.get("operations"), list):
+        # Single-element operations[] is a canonical LBP 1.2 spelling, not a 1.1
+        # compatibility path. The unrestricted multi-operation array is not restored.
         legacy = raw["operations"]
         if len(legacy) != 1:
             raise ValueError("Legacy operations[] is accepted only when it contains exactly one operation")
@@ -1484,16 +2816,43 @@ def normalize_task(raw: Any) -> dict[str, Any]:
         value = validate_task_text(raw.get(field), field, max_len)
         if value is not None:
             normalized[field] = value
+    if "plan" in raw:
+        if task_version != "1.3":
+            raise ValueError("task.plan requires LBP 1.3")
+        normalized["plan"] = normalize_plan(raw.get("plan"))
+    for field in ("plan_id", "plan_item_id"):
+        if field in raw:
+            normalized[field] = validate_metadata_id(raw.get(field), f"task.{field}")
+    if "plan_revision" in raw:
+        try:
+            plan_revision = int(raw.get("plan_revision"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("task.plan_revision must be an integer") from exc
+        if plan_revision < 1:
+            raise ValueError("task.plan_revision must be >= 1")
+        normalized["plan_revision"] = plan_revision
+    if "outputs" in raw:
+        if task_version != "1.3":
+            raise ValueError("task.outputs requires LBP 1.3")
+        normalized["outputs"] = normalize_outputs(raw.get("outputs"))
     return normalized
 
 
 def current_tool_catalog(server: str, client: McpHttpClient) -> dict[str, dict[str, Any]]:
     tools_result = client.list_tools()
-    return {
+    catalog = {
         tool.get("name"): tool
         for tool in tools_result.get("tools", [])
         if isinstance(tool, dict) and isinstance(tool.get("name"), str)
     }
+    # Record the classification-relevant shape of the catalog so approvals can be
+    # bound to it. Only the derived classification matters, not descriptions.
+    shape = {name: tool_classification(tool) for name, tool in catalog.items()}
+    with TOOL_CATALOG_GUARD:
+        TOOL_CATALOG_FINGERPRINTS[server] = hashlib.sha256(
+            canonical_json(shape).encode("utf-8")
+        ).hexdigest()
+    return catalog
 
 
 def preflight_call(
@@ -1514,6 +2873,26 @@ def preflight_call(
         raise ValueError(f"tool_policy_denied: {server}.{tool_name} is not in allowed_tools")
     arguments = call.get("arguments", {})
     classification, verification = effective_classification(tool, tool_name, arguments, cfg)
+    if classification in {"write", "destructive"}:
+        # Root containment inspects path-shaped ARGUMENTS. It cannot read inside a
+        # free-form payload, and for a patch-shaped tool the payload header is
+        # exactly where the write target lives -- so for these tools `roots`
+        # constrains nothing at all.
+        #
+        # Rather than pretend otherwise, such a tool is ineligible for write
+        # authority unless the operator has explicitly acknowledged it by listing
+        # it in freeform_write_tools for this server.
+        freeform = sorted({
+            key for key in arguments
+            if isinstance(key, str) and is_freeform_text_key(key)
+        })
+        if freeform and tool_name not in set(cfg.get("freeform_write_tools", [])):
+            raise ValueError(
+                f"freeform_policy_denied: {server}.{tool_name} carries free-form payload "
+                f"field(s) {', '.join(freeform)} that configured roots cannot constrain. "
+                f"Add {tool_name!r} to this server's freeform_write_tools to accept that "
+                "explicitly, or use a tool with explicit path arguments."
+            )
     if classification == "write" and not cfg.get("write", False):
         raise ValueError(f"write_policy_denied: {server}.{tool_name} is write; enable writes for this server")
     if classification == "destructive":
@@ -1597,14 +2976,14 @@ def preflight_operation(op: dict[str, Any]) -> dict[str, Any]:
 def preflight_task(
     raw: Any,
     session_id: str | None = None,
-    chain_id: str | None = None,
+    window_id: str | None = None,
+    conversation_id: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     session_id = validate_browser_session_id(session_id)
-    chain_id = validate_chain_id(chain_id)
     task = normalize_task(raw)
     operation = preflight_operation(task["operation"])
     cfg = get_server_config(operation["server"])
-    approval = approval_decision(operation["server"], operation["classification"], cfg, session_id, chain_id)
+    approval = approval_decision(operation["server"], operation["classification"], cfg, conversation_id, window_id)
     preview = {
         "protocol": "lbp",
         "version": LBP_VERSION,
@@ -1637,15 +3016,40 @@ def execute_preflighted_call(
         result["id"] = call["id"]
     status = "ok"
     applied_mutations: list[dict[str, Any]] = []
+    mutating = classification in {"write", "destructive"}
+
+    # LBP 1.3 mutation ambiguity rule.
+    #
+    # Once a WRITE/DESTRUCTIVE call has been dispatched, any outcome that is not
+    # an unambiguous success is `unknown`, never `error`. `unknown` is stronger
+    # than `error`, not softer: it stops the chain and requires explicit human
+    # acknowledgement. A false `unknown` costs one click; a false `error` invites
+    # the assistant to retry an operation that may already have been applied.
+    #
+    # Pre-dispatch failures stay ordinary `error`, so the common path is
+    # unaffected, and READ/VERIFY failures stay `error` throughout.
     try:
-        raw_result = get_mcp_client(server).call_tool(call["tool"], call.get("arguments", {}))
+        raw_result = get_mcp_client(server).call_tool(
+            call["tool"],
+            call.get("arguments", {}),
+            allow_session_retry=not mutating,
+        )
         clipped, truncated = clip_mcp_value(raw_result)
         result["result"] = clipped
         result["truncated"] = truncated
         result["mcp_is_error"] = bool(raw_result.get("isError", False)) if isinstance(raw_result, dict) else False
         if result["mcp_is_error"]:
-            status = "error"
-        elif classification in {"write", "destructive"}:
+            # The tool ran and reported failure. For a mutating tool that says
+            # nothing about whether it applied anything first -- a patch that
+            # failed at hunk 3 of 5 has already written hunks 1 and 2.
+            if mutating:
+                status = "unknown"
+                result["execution_state"] = "unknown"
+                result["ambiguity_reason"] = "mcp_is_error_after_dispatch"
+            else:
+                status = "error"
+                result["execution_state"] = "failed"
+        elif mutating:
             applied_mutations.append({
                 "server": server,
                 "tool": call.get("tool"),
@@ -1653,20 +3057,27 @@ def execute_preflighted_call(
             })
     except (socket.timeout, TimeoutError) as exc:
         result["error"] = f"timeout: {exc}"
-        if classification in {"write", "destructive"}:
-            result["execution_state"] = "unknown"
+        if mutating:
             status = "unknown"
+            result["execution_state"] = "unknown"
+            result["ambiguity_reason"] = "timeout_after_dispatch"
         else:
-            result["execution_state"] = "failed"
             status = "error"
+            result["execution_state"] = "failed"
     except Exception as exc:
         result["error"] = str(exc)
-        if classification in {"write", "destructive"} and isinstance(exc, (ConnectionError, http.client.HTTPException, OSError)):
-            result["execution_state"] = "unknown"
+        # Default to dispatched. Anything raised after the HTTP client returned
+        # -- malformed body, id mismatch, JSON-RPC error object, oversize
+        # response -- carries no marker and must be assumed to have reached the
+        # server.
+        dispatched = bool(getattr(exc, "lbp_dispatched", True))
+        if mutating and dispatched:
             status = "unknown"
+            result["execution_state"] = "unknown"
+            result["ambiguity_reason"] = "exception_after_dispatch"
         else:
-            result["execution_state"] = "failed"
             status = "error"
+            result["execution_state"] = "failed"
     result["status"] = status
     result["duration_ms"] = int((time.time() - started) * 1000)
     return result, status, applied_mutations
@@ -1745,7 +3156,16 @@ def execute_task(task: dict[str, Any], preview: dict[str, Any]) -> dict[str, Any
         operation_result["applied_calls"] = len(applied_mutations)
         operation_result["failed_calls"] = failed
         operation_result["skipped_calls"] = skipped
-        operation_result["partial_execution"] = bool(applied_mutations) and (failed > 0 or skipped > 0)
+        partial = bool(applied_mutations) and (failed > 0 or skipped > 0)
+        operation_result["partial_execution"] = partial
+        if partial and status != "unknown":
+            # Some calls landed and the batch then stopped. There is no rollback,
+            # so retrying the whole batch would re-apply what already succeeded.
+            # The task status is what the assistant reads, so it must say
+            # "ambiguous", not "failed" -- the partial_execution flag alone is
+            # buried in the operation body.
+            status = "unknown"
+            operation_result["ambiguity_reason"] = "partial_mutation_batch"
     elif op["type"] == "mcp.list_tools":
         with lock.read():
             try:
@@ -1778,53 +3198,152 @@ def execute_task(task: dict[str, Any], preview: dict[str, Any]) -> dict[str, Any
         "completed_at": int(time.time()),
         "operation": operation_result,
         "applied_mutations": applied_mutations,
+        "outputs": [
+            {
+                **output,
+                "status": "produced" if status == "ok" else "unknown" if status == "unknown" else "failed",
+            }
+            for output in task.get("outputs", [])
+        ],
     }
 
 
-def task_key(task_id: str) -> str:
-    return hashlib.sha256(task_id.encode("utf-8")).hexdigest()
+# --- Registered-task execution ------------------------------------------------
 
 
-def task_lock(key: str) -> threading.RLock:
-    with TASK_LOCKS_GUARD:
-        return TASK_LOCKS.setdefault(key, threading.RLock())
+def evict_superseded_chain_leases(chain_id: Any, current_window: int) -> None:
+    """Drop chain leases for windows the conversation has already left.
+
+    They are unreachable anyway (chain_id is random per chain and window only
+    increases), but leaving them to age out means a superseded grant lingers in
+    memory for the full lease TTL. Evict eagerly.
+    """
+    if not isinstance(chain_id, str) or not chain_id:
+        return
+    prefix = f"{chain_id}.w"
+    with APPROVAL_LOCK:
+        for key in list(CHAIN_LEASES):
+            window_id = key[1] if isinstance(key, tuple) and len(key) > 1 else None
+            if not isinstance(window_id, str) or not window_id.startswith(prefix):
+                continue
+            try:
+                window = int(window_id[len(prefix):])
+            except ValueError:
+                continue
+            if window < current_window:
+                CHAIN_LEASES.pop(key, None)
 
 
-def task_paths(key: str) -> tuple[pathlib.Path, pathlib.Path]:
-    return TASK_DIR / f"{key}.task.json", TASK_DIR / f"{key}.result.json"
+def conversation_execution_context(conversation_id: str, registration_id: Any) -> tuple[dict[str, Any], str]:
+    """Resolve a registration and prove it is executable right now.
+
+    This is the hard daemon-side stale-execution barrier. A browser bug, a
+    reload, provider virtualization or a rediscovered historical task cannot get
+    past it, because currentness is decided from daemon state and never from
+    anything the browser asserts.
+
+    Returns (journal record, daemon-derived approval window id).
+    """
+    conversation_id = validate_conversation_id(conversation_id)
+    record = resolve_registration(registration_id)
+    if record.get("conversation_id") != conversation_id:
+        raise ValueError("stale_task: registration does not belong to this conversation")
+
+    with conversation_state_lock(conversation_id):
+        state = load_conversation_state(conversation_id)
+
+    if not state.get("enabled"):
+        raise ValueError("stale_task: conversation is not enabled")
+    if state.get("phase") in {"stopped", "disabled"}:
+        raise ValueError(f"stale_task: conversation is {state.get('phase')}")
+    chain = state.get("active_chain")
+    if not isinstance(chain, dict):
+        raise ValueError("stale_task: conversation has no active chain")
+    if record.get("registration_id") != state.get("current_registration"):
+        raise ValueError("stale_task: this is not the current registered task for the conversation")
+    if record.get("chain_id") != chain.get("chain_id"):
+        raise ValueError("stale_task: task belongs to a superseded chain")
+    if int(record.get("window", -1)) != int(chain.get("window", 0)):
+        raise ValueError("stale_task: task belongs to a superseded checkpoint window")
+
+    # Derived here, never accepted from the browser.
+    window_id = f"{chain.get('chain_id')}.w{int(chain.get('window', 0))}"
+    return record, window_id
 
 
-def execute_journaled(
-    raw_task: Any,
-    session_id: str | None = None,
-    approval_token: str | None = None,
-    chain_id: str | None = None,
+def preview_registered_task(
+    conversation_id: str,
+    registration_id: Any,
+    session_id: str | None,
+) -> dict[str, Any]:
+    record, window_id = conversation_execution_context(conversation_id, registration_id)
+    _, preview = preflight_task(record["task"], session_id, window_id, conversation_id)
+    preview["registration_id"] = record["registration_id"]
+    preview["execution_status"] = record.get("execution_status")
+    preview["delivery_status"] = record.get("delivery_status")
+    return preview
+
+
+def approve_registered_task(
+    conversation_id: str,
+    registration_id: Any,
+    session_id: str | None,
+    decision: Any,
+) -> dict[str, Any]:
+    record, window_id = conversation_execution_context(conversation_id, registration_id)
+    return grant_approval(record["task"], session_id, decision, window_id, conversation_id)
+
+
+def execute_registered_task(
+    conversation_id: str,
+    registration_id: Any,
+    session_id: str | None,
+    approval_token: str | None,
 ) -> tuple[dict[str, Any], bool, str]:
     session_id = validate_browser_session_id(session_id)
-    chain_id = validate_chain_id(chain_id)
-    # Replay is a journal read, not another local MCP execution. Resolve it before
-    # contacting the MCP server or asking for a fresh approval.
-    task = normalize_task(raw_task)
-    key = task_key(task["id"])
-    task_path, result_path = task_paths(key)
-    lock = task_lock(key)
-    with lock:
-        canonical = canonical_json(task)
-        if task_path.exists():
-            previous = json.loads(task_path.read_text(encoding="utf-8"))
-            if canonical_json(previous) != canonical:
-                raise ValueError(f"task id {task['id']!r} already exists with different content; use a new task id")
-            if result_path.exists():
-                return json.loads(result_path.read_text(encoding="utf-8")), True, key
+    record, window_id = conversation_execution_context(conversation_id, registration_id)
+    key = record["key"]
+
+    with task_lock(key):
+        record = load_journal(key) or record
+        status = record.get("execution_status")
+
+        # Replay resolves only AFTER policy is re-evaluated, so a stored result
+        # can never be returned for an operation the current policy would now
+        # refuse -- server removed, tool disallowed, roots narrowed.
+        task, preview = preflight_task(record["task"], session_id, window_id, conversation_id)
+
+        if status in {"completed", "error", "unknown"} and isinstance(record.get("result"), dict):
+            return record["result"], True, key
+
+        if status == "executing":
             raise ValueError(
-                "ambiguous_task_state: journal exists without a result; do not retry automatically. "
-                f"Recovery key: {key}"
+                "ambiguous_task_state: this task was dispatched and no result was recorded; "
+                "do not retry automatically. "
+                f"Acknowledge with DELETE /v1/tasks/{key}?acknowledge_ambiguous=true"
             )
-        task, preview = preflight_task(task, session_id, chain_id)
+
+        if status != "registered":
+            raise ValueError(f"task is not executable from status {status!r}")
+
         authorize_execution(task, preview, session_id, approval_token)
-        atomic_write_json(task_path, task)
+
+        # The dispatch marker. Only this transition makes a crash ambiguous;
+        # a registered-but-never-dispatched task stays cleanly executable.
+        record["execution_status"] = "executing"
+        record["dispatched_at"] = int(time.time())
+        record = save_journal(record)
+
         result = execute_task(task, preview)
-        atomic_write_json(result_path, result)
+
+        record["result"] = result
+        record["execution_status"] = (
+            "completed" if result["status"] == "ok"
+            else "unknown" if result["status"] == "unknown"
+            else "error"
+        )
+        record["delivery_status"] = "none"
+        save_journal(record)
         return result, False, key
 
 
@@ -1833,13 +3352,28 @@ def recover_ambiguous_task(key: str, acknowledged: bool) -> None:
         raise ValueError("set acknowledge_ambiguous=true to clear an unfinished journal")
     if len(key) != 64 or any(ch not in "0123456789abcdef" for ch in key):
         raise ValueError("invalid task journal key")
-    task_path, result_path = task_paths(key)
     with task_lock(key):
-        if result_path.exists():
-            raise ValueError("completed task journals are not deleted by recovery")
-        if not task_path.exists():
+        record = load_journal(key)
+        if record is None:
             raise ValueError("ambiguous journal not found")
-        task_path.unlink()
+        if isinstance(record.get("result"), dict):
+            raise ValueError("completed task journals are not deleted by recovery")
+        if record.get("execution_status") != "executing":
+            raise ValueError("only a dispatched-but-unfinished task can be recovered")
+        record["execution_status"] = "unknown"
+        record["recovered_at"] = int(time.time())
+        record["result"] = {
+            "protocol": "lbp",
+            "version": LBP_VERSION,
+            "bridge_version": VERSION,
+            "task_id": record.get("task_id"),
+            "title": record.get("title"),
+            "status": "unknown",
+            "completed_at": int(time.time()),
+            "operation": {"execution_state": "unknown", "error": "acknowledged_ambiguous_dispatch"},
+            "applied_mutations": [],
+        }
+        save_journal(record)
 
 
 def valid_host(host_header: str | None) -> bool:
@@ -1909,7 +3443,7 @@ class Handler(BaseHTTPRequestHandler):
                 "ok": True,
                 "service": "local-mcp-bridge",
                 "version": VERSION,
-                "protocols": [{"name": "lbp", "versions": ["1.3", "1.2"]}],
+                "protocols": [{"name": "lbp", "versions": sorted(SUPPORTED_LBP_TASK_VERSIONS, reverse=True)}],
                 "operations": ["mcp.call", "mcp.list_tools", "mcp.observe", "mcp.mutate"],
                 "execution_model": "rw-barrier: observe(read+verify) shared, mutate/write/destructive exclusive; mutation batches ordered and stop on first failure",
                 "max_observe_calls": MAX_OBSERVE_CALLS,
@@ -1924,6 +3458,9 @@ class Handler(BaseHTTPRequestHandler):
             snapshot = servers_snapshot()
             self._send(200, {"ok": True, "servers": snapshot, "version": registry_version(snapshot)})
             return
+        if self.path == "/v1/context/workspaces":
+            self._send(200, {"ok": True, "sources": configured_context_workspaces()})
+            return
         self._send(404, {"ok": False, "error": "not found"})
 
     def do_POST(self) -> None:
@@ -1937,37 +3474,55 @@ class Handler(BaseHTTPRequestHandler):
                 if not isinstance(action, str):
                     raise ValueError("conversation state action must be a string")
                 payload = body.get("payload") if isinstance(body.get("payload"), dict) else {}
-                state = update_conversation_state(conversation_id, action, payload)
+                try:
+                    state = update_conversation_state(conversation_id, action, payload)
+                except ConversationConflict as conflict:
+                    # Optimistic-concurrency failure is a normal outcome with two
+                    # tabs, not an error: hand back current state so the caller
+                    # can reconcile and retry rather than double-applying.
+                    self._send(409, {"ok": False, "error": str(conflict), "state": conflict.state})
+                    return
                 self._send(200, {"ok": True, "state": state})
                 return
+            if self.path == "/v1/conversation-state/bind":
+                body = self._read_json_body()
+                state = bind_conversation(body.get("provisional_id"), body.get("canonical_id"))
+                self._send(200, {"ok": True, "state": state})
+                return
+            if self.path == "/v1/context/choose-folder":
+                self._read_json_body()
+                self._send(200, {"ok": True, **choose_context_folder_native()})
+                return
+            # Preview / approval / execution all address a task the daemon
+            # registered and normalized itself. The browser supplies a handle,
+            # never a task body, so task content cannot change between phases.
             if self.path == "/v1/tasks/preview":
                 body = self._read_json_body()
-                raw_task = body.get("task") if isinstance(body.get("task"), dict) else body
-                session_id = body.get("session_id") if raw_task is not body else None
-                chain_id = body.get("chain_id") if raw_task is not body else None
-                _, preview = preflight_task(raw_task, session_id, chain_id)
+                preview = preview_registered_task(
+                    body.get("conversation_id"),
+                    body.get("registration"),
+                    body.get("session_id"),
+                )
                 self._send(200, {"ok": True, "preview": preview})
                 return
             if self.path == "/v1/approvals":
                 body = self._read_json_body()
-                raw_task = body.get("task")
-                if not isinstance(raw_task, dict):
-                    raise ValueError("task is required")
-                result = grant_approval(
-                    raw_task,
+                result = approve_registered_task(
+                    body.get("conversation_id"),
+                    body.get("registration"),
                     body.get("session_id"),
                     body.get("decision"),
-                    body.get("chain_id"),
                 )
                 self._send(200, {"ok": True, **result})
                 return
             if self.path == "/v1/tasks":
                 body = self._read_json_body()
-                raw_task = body.get("task") if isinstance(body.get("task"), dict) else body
-                session_id = body.get("session_id") if raw_task is not body else None
-                approval_token = body.get("approval_token") if raw_task is not body else None
-                chain_id = body.get("chain_id") if raw_task is not body else None
-                result, replayed, key = execute_journaled(raw_task, session_id, approval_token, chain_id)
+                result, replayed, key = execute_registered_task(
+                    body.get("conversation_id"),
+                    body.get("registration"),
+                    body.get("session_id"),
+                    body.get("approval_token"),
+                )
                 self._send(200, {"ok": True, "result": result, "replayed": replayed, "journal_key": key})
                 return
             if self.path == "/v1/servers":

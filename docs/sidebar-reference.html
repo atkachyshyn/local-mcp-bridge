@@ -1,0 +1,673 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=941, initial-scale=1">
+<title>Local MCP Bridge — exact sidebar reference</title>
+<style>
+  :root{
+    --bg:#090909;
+    --panel:#191919;
+    --panel-2:#1d1d1d;
+    --line:rgba(255,255,255,.105);
+    --line-strong:rgba(255,255,255,.16);
+    --text:#f2f2f2;
+    --text2:#b9b9b9;
+    --text3:#858585;
+    --blue:#4093f5;
+    --blue-soft:#9ccaff;
+    --green:#7be876;
+    --red:#ff776c;
+  }
+
+  *{box-sizing:border-box}
+  html,body{
+    margin:0;
+    width:941px;
+    min-width:941px;
+    height:1672px;
+    min-height:1672px;
+    overflow:hidden;
+    background:
+      radial-gradient(1200px 1300px at 50% 45%, rgba(255,255,255,.018), transparent 62%),
+      #080808;
+    color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","SF Pro Text","Segoe UI",Inter,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+
+  button{font:inherit;color:inherit}
+
+  .stage{
+    position:relative;
+    width:941px;
+    height:1672px;
+  }
+
+  /* top connection pill */
+  .connection{
+    position:absolute;
+    top:22px;
+    left:23px;
+    height:76px;
+    min-width:535px;
+    padding:0 34px 0 37px;
+    display:flex;
+    align-items:center;
+    gap:20px;
+    border:1px solid rgba(255,255,255,.17);
+    border-radius:38px;
+    background:linear-gradient(180deg,#1b1b1b,#171717);
+    box-shadow:
+      inset 0 1px 0 rgba(255,255,255,.03),
+      0 4px 16px rgba(0,0,0,.16);
+    font-size:27px;
+    line-height:1;
+    font-weight:500;
+    letter-spacing:-.018em;
+    color:#c8c8c8;
+    white-space:nowrap;
+  }
+  .connection-dot{
+    width:21px;
+    height:21px;
+    flex:0 0 21px;
+    border-radius:50%;
+    background:var(--green);
+    box-shadow:
+      0 0 16px rgba(123,232,118,.24),
+      inset 0 1px 1px rgba(255,255,255,.45);
+  }
+
+  /* main panel */
+  .panel{
+    position:absolute;
+    top:116px;
+    left:23px;
+    width:884px;
+    height:1508px;
+    overflow:hidden;
+    border:1px solid rgba(255,255,255,.16);
+    border-radius:22px;
+    background:
+      radial-gradient(1000px 900px at 50% 35%, rgba(255,255,255,.017), transparent 68%),
+      linear-gradient(180deg,#1a1a1a,#181818);
+    box-shadow:
+      inset 0 1px 0 rgba(255,255,255,.025),
+      0 6px 28px rgba(0,0,0,.18);
+  }
+
+  .progress{
+    position:absolute;
+    left:0;
+    top:0;
+    width:100%;
+    height:1159px;
+    padding:35px 38px 0 38px;
+  }
+
+  .progress-title-row{
+    height:55px;
+    display:flex;
+    align-items:flex-start;
+    justify-content:space-between;
+  }
+  .progress-title{
+    margin:0;
+    font-size:37px;
+    line-height:1;
+    font-weight:500;
+    letter-spacing:-.03em;
+  }
+
+  .chevron-up{
+    position:relative;
+    width:28px;
+    height:22px;
+    margin-top:10px;
+    margin-right:6px;
+  }
+  .chevron-up:before,
+  .chevron-up:after{
+    content:"";
+    position:absolute;
+    top:7px;
+    width:15px;
+    height:3px;
+    border-radius:3px;
+    background:#b5b5b5;
+  }
+  .chevron-up:before{left:0;transform:rotate(-45deg);transform-origin:right center}
+  .chevron-up:after{right:0;transform:rotate(45deg);transform-origin:left center}
+
+  .meta-row{
+    height:108px;
+    display:flex;
+    align-items:flex-start;
+    justify-content:space-between;
+    padding-top:20px;
+    border-bottom:1px solid rgba(255,255,255,.085);
+    color:#b7b7b7;
+    font-size:27px;
+    letter-spacing:-.02em;
+  }
+
+  .meta-left{
+    display:flex;
+    align-items:center;
+    gap:17px;
+  }
+  .active-dot{
+    width:18px;height:18px;border-radius:50%;
+    background:#3e87e5;
+    box-shadow:inset 0 1px 1px rgba(255,255,255,.28);
+  }
+  .meta-sep{color:#858585;margin:0 2px}
+
+  .meta-right{
+    display:flex;
+    align-items:center;
+    gap:14px;
+    padding-right:1px;
+  }
+
+  .bookmark{
+    width:20px;
+    height:25px;
+    position:relative;
+    margin-top:0;
+  }
+  .bookmark svg{width:20px;height:25px;display:block}
+
+  /* timeline */
+  .timeline{
+    position:absolute;
+    left:38px;
+    right:24px;
+    top:189px;
+    height:812px;
+  }
+  .timeline-line{
+    position:absolute;
+    left:17px;
+    top:29px;
+    width:2px;
+    height:791px;
+    background:rgba(192,199,208,.38);
+  }
+
+  .step{
+    position:absolute;
+    left:0;
+    width:100%;
+    min-height:112px;
+    display:grid;
+    grid-template-columns:37px 44px 1fr;
+    column-gap:16px;
+  }
+  .step.s1{top:12px}
+  .step.s2{top:127px}
+  .step.s3{top:242px}
+  .step.s4{top:358px}
+  .step.s5{top:474px}
+  .step.s6{top:590px}
+  .step.s7{top:706px}
+  .step.s8{top:822px}
+
+  .marker{
+    width:37px;
+    height:37px;
+    border-radius:50%;
+    position:relative;
+    z-index:2;
+    margin-top:1px;
+    background:#1a1a1a;
+    border:2px solid #747b83;
+  }
+
+  .done .marker{
+    border-color:var(--blue);
+    background:var(--blue);
+  }
+  .done .marker:after{
+    content:"";
+    position:absolute;
+    width:11px;height:7px;
+    left:11px;top:11px;
+    border-left:2px solid #071525;
+    border-bottom:2px solid #071525;
+    transform:rotate(-45deg);
+  }
+
+  .current{
+    left:-12px;
+    width:calc(100% + 2px);
+    min-height:116px;
+    padding:11px 17px 10px 12px;
+    border:1px solid rgba(64,147,245,.60);
+    border-radius:22px;
+    background:
+      linear-gradient(90deg,rgba(53,117,204,.16),rgba(48,104,180,.25));
+    box-shadow:inset 0 0 30px rgba(58,121,209,.035);
+    grid-template-columns:37px 44px 1fr;
+  }
+  .current .marker{
+    width:46px;
+    height:46px;
+    margin-left:-5px;
+    margin-top:-1px;
+    border:2px solid var(--blue);
+    background:#182238;
+    box-shadow:0 0 0 1px rgba(64,147,245,.16);
+  }
+  .current .marker:after{
+    content:"";
+    position:absolute;
+    left:10px;top:10px;
+    width:22px;height:22px;
+    border-radius:50%;
+    background:var(--blue);
+  }
+
+  .num{
+    padding-top:3px;
+    color:#c7c7c7;
+    font-size:27px;
+    line-height:1.1;
+    font-weight:400;
+  }
+  .current .num{padding-top:5px;color:#a9cbf7}
+
+  .copy{
+    padding-top:0;
+    min-width:0;
+  }
+  .title-row{
+    display:flex;
+    align-items:flex-start;
+    justify-content:space-between;
+    gap:20px;
+  }
+  .step-title{
+    font-size:28px;
+    line-height:1.18;
+    color:#d1d1d1;
+    letter-spacing:-.022em;
+    white-space:nowrap;
+  }
+  .current .step-title{
+    color:#f4f4f4;
+    font-weight:500;
+  }
+  .sub{
+    margin-top:13px;
+    font-size:25px;
+    line-height:1;
+    color:#8f8f8f;
+    letter-spacing:-.014em;
+  }
+  .current .sub{color:#93c3ff}
+
+  .current-tag{
+    flex:0 0 auto;
+    height:48px;
+    display:flex;
+    align-items:center;
+    padding:0 18px;
+    margin-top:-3px;
+    border:1px solid rgba(255,255,255,.14);
+    border-radius:24px;
+    background:rgba(13,17,24,.35);
+    color:#bdbdbd;
+    font-size:23px;
+    letter-spacing:-.015em;
+    white-space:nowrap;
+  }
+
+  .checkpoint-footer{
+    position:absolute;
+    left:38px;
+    right:38px;
+    bottom:0;
+    height:78px;
+    border-top:1px solid rgba(255,255,255,.085);
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    color:#b7b7b7;
+    font-size:24px;
+    letter-spacing:-.02em;
+  }
+  .auto{
+    display:flex;
+    align-items:center;
+    gap:17px;
+  }
+  .switch{
+    position:relative;
+    width:55px;
+    height:30px;
+    border-radius:17px;
+    background:#3c91f4;
+    box-shadow:inset 0 0 0 1px rgba(255,255,255,.08);
+  }
+  .switch-knob{
+    position:absolute;
+    top:3px;
+    right:3px;
+    width:24px;
+    height:24px;
+    border-radius:50%;
+    background:#fff;
+    box-shadow:0 1px 4px rgba(0,0,0,.35);
+  }
+
+  /* Outputs */
+  .outputs{
+    position:absolute;
+    left:0;
+    top:1159px;
+    width:100%;
+    height:82px;
+    padding:0 38px;
+    border-top:1px solid rgba(255,255,255,.07);
+    border-bottom:1px solid rgba(255,255,255,.09);
+    display:flex;
+    align-items:center;
+    justify-content:flex-start;
+    gap:24px;
+  }
+  .section-name{
+    font-size:35px;
+    line-height:1;
+    font-weight:500;
+    letter-spacing:-.03em;
+  }
+  .down{
+    width:22px;height:14px;position:relative;margin-top:4px;
+  }
+  .down:before,.down:after{
+    content:"";position:absolute;top:3px;width:14px;height:3px;background:#b6b6b6;border-radius:3px;
+  }
+  .down:before{left:0;transform:rotate(45deg);transform-origin:right center}
+  .down:after{right:0;transform:rotate(-45deg);transform-origin:left center}
+
+  /* Context */
+  .context{
+    position:absolute;
+    left:0;
+    top:1241px;
+    width:100%;
+    height:158px;
+    padding:0 38px;
+    border-bottom:1px solid rgba(255,255,255,.09);
+  }
+  .context-header{
+    height:79px;
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+  }
+  .context-left{
+    display:flex;
+    align-items:center;
+    gap:24px;
+  }
+  .plus{
+    width:31px;height:31px;
+    border:2px solid #9d9d9d;
+    border-radius:5px;
+    position:relative;
+    margin-right:5px;
+  }
+  .plus:before,.plus:after{
+    content:"";position:absolute;background:#b8b8b8;border-radius:2px;
+  }
+  .plus:before{width:16px;height:2px;left:6px;top:13px}
+  .plus:after{width:2px;height:16px;left:13px;top:6px}
+
+  .chip{
+    display:inline-flex;
+    align-items:center;
+    gap:13px;
+    height:43px;
+    padding:0 17px;
+    border:1px solid rgba(255,255,255,.10);
+    border-radius:9px;
+    background:#1d1d1d;
+    color:#bdbdbd;
+    font-size:23px;
+    letter-spacing:-.02em;
+  }
+  .folder{
+    width:26px;height:18px;position:relative;
+    border:2px solid #b8b8b8;border-radius:3px;
+  }
+  .folder:before{
+    content:"";position:absolute;left:2px;top:-7px;width:12px;height:7px;
+    border:2px solid #b8b8b8;border-bottom:0;border-radius:3px 3px 0 0;
+  }
+
+  /* Action bar */
+  .actions{
+    position:absolute;
+    left:0;
+    bottom:0;
+    width:100%;
+    height:109px;
+    padding:22px 24px 23px 24px;
+    display:grid;
+    grid-template-columns:1fr 1fr 1fr;
+    gap:12px;
+  }
+  .action{
+    height:64px;
+    border:1px solid rgba(255,255,255,.14);
+    border-radius:12px;
+    background:#1b1b1b;
+    color:#b8b8b8;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    gap:16px;
+    font-size:22px;
+    letter-spacing:-.015em;
+  }
+  .action.stop{color:#ff776c}
+
+  .eye{
+    width:28px;height:18px;position:relative;
+  }
+  .eye:before{
+    content:"";position:absolute;left:1px;top:2px;width:25px;height:14px;
+    border:2px solid #8f8f8f;border-radius:50% / 65%;
+  }
+  .eye:after{
+    content:"";position:absolute;left:13px;top:-3px;width:2px;height:28px;
+    background:#8f8f8f;transform:rotate(-45deg);border-radius:2px;
+  }
+  .stop-icon{
+    width:19px;height:19px;border:2px solid #ff776c;border-radius:3px;
+  }
+  .gear{
+    width:28px;height:28px;position:relative;
+  }
+  .gear svg{width:28px;height:28px;display:block}
+</style>
+</head>
+<body>
+<div class="stage">
+
+  <div class="connection">
+    <span class="connection-dot"></span>
+    <span>Connected · Bridge v0.9.2 · LBP 1.3</span>
+  </div>
+
+  <section class="panel">
+
+    <div class="progress">
+      <div class="progress-title-row">
+        <h1 class="progress-title">Progress</h1>
+        <div class="chevron-up" aria-hidden="true"></div>
+      </div>
+
+      <div class="meta-row">
+        <div class="meta-left">
+          <span class="active-dot"></span>
+          <span>Active</span>
+          <span class="meta-sep">·</span>
+          <span>Auto</span>
+          <span class="meta-sep">·</span>
+          <span>3/12</span>
+        </div>
+
+        <div class="meta-right">
+          <span>Checkpoint at 12</span>
+          <span class="bookmark" aria-hidden="true">
+            <svg viewBox="0 0 20 25" fill="none">
+              <path d="M3 2.5h14v19l-7-4.6-7 4.6v-19Z"
+                    stroke="#b9b9b9" stroke-width="2.2"
+                    stroke-linejoin="round"/>
+            </svg>
+          </span>
+        </div>
+      </div>
+
+      <div class="timeline">
+        <div class="timeline-line"></div>
+
+        <div class="step done s1">
+          <div class="marker"></div>
+          <div class="num">1</div>
+          <div class="copy">
+            <div class="step-title">Rotate repo hygiene token</div>
+            <div class="sub">Completed · 14:02:11</div>
+          </div>
+        </div>
+
+        <div class="step done s2">
+          <div class="marker"></div>
+          <div class="num">2</div>
+          <div class="copy">
+            <div class="step-title">Load bridge config</div>
+            <div class="sub">Completed · 14:02:12</div>
+          </div>
+        </div>
+
+        <div class="step current s3">
+          <div class="marker"></div>
+          <div class="num">3</div>
+          <div class="copy">
+            <div class="title-row">
+              <div class="step-title">Freeze LBP to 1.3</div>
+              <div class="current-tag">Current step</div>
+            </div>
+            <div class="sub">Align tests&nbsp;&nbsp;·&nbsp;&nbsp;In progress</div>
+          </div>
+        </div>
+
+        <div class="step pending s4">
+          <div class="marker"></div>
+          <div class="num">4</div>
+          <div class="copy">
+            <div class="step-title">Resolve identities &amp; state</div>
+            <div class="sub">Pending</div>
+          </div>
+        </div>
+
+        <div class="step pending s5">
+          <div class="marker"></div>
+          <div class="num">5</div>
+          <div class="copy">
+            <div class="step-title">Task registration</div>
+            <div class="sub">Pending</div>
+          </div>
+        </div>
+
+        <div class="step pending s6">
+          <div class="marker"></div>
+          <div class="num">6</div>
+          <div class="copy">
+            <div class="step-title">Conservative mutation check</div>
+            <div class="sub">Pending</div>
+          </div>
+        </div>
+
+        <div class="step pending s7">
+          <div class="marker"></div>
+          <div class="num">7</div>
+          <div class="copy">
+            <div class="step-title">Approval scopes &amp; path policy</div>
+            <div class="sub">Pending</div>
+          </div>
+        </div>
+
+        <div class="step pending s8">
+          <div class="marker"></div>
+          <div class="num">8</div>
+          <div class="copy">
+            <div class="step-title">Extension protocol validation</div>
+            <div class="sub">Pending</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="checkpoint-footer">
+        <span>3/12 until checkpoint</span>
+        <div class="auto">
+          <span>Auto-continue</span>
+          <span class="switch"><span class="switch-knob"></span></span>
+        </div>
+      </div>
+    </div>
+
+    <div class="outputs">
+      <div class="section-name">Outputs</div>
+      <div class="down" aria-hidden="true"></div>
+    </div>
+
+    <div class="context">
+      <div class="context-header">
+        <div class="context-left">
+          <div class="section-name">Context</div>
+          <div class="down" aria-hidden="true"></div>
+        </div>
+        <div class="plus" aria-hidden="true"></div>
+      </div>
+
+      <div class="chip">
+        <span class="folder" aria-hidden="true"></span>
+        <span>local-mcp-bridge</span>
+      </div>
+    </div>
+
+    <div class="actions">
+      <div class="action">
+        <span class="eye" aria-hidden="true"></span>
+        <span>Hide protocol</span>
+      </div>
+
+      <div class="action stop">
+        <span class="stop-icon" aria-hidden="true"></span>
+        <span>Stop chain</span>
+      </div>
+
+      <div class="action">
+        <span class="gear" aria-hidden="true">
+          <svg viewBox="0 0 28 28" fill="none">
+            <circle cx="14" cy="14" r="4" stroke="#aaa" stroke-width="2"/>
+            <path d="M14 2.8v3M14 22.2v3M2.8 14h3M22.2 14h3
+                     M6.1 6.1l2.1 2.1M19.8 19.8l2.1 2.1
+                     M21.9 6.1l-2.1 2.1M8.2 19.8l-2.1 2.1"
+                  stroke="#aaa" stroke-width="2" stroke-linecap="round"/>
+            <circle cx="14" cy="14" r="9" stroke="#aaa" stroke-width="2"/>
+          </svg>
+        </span>
+        <span>Settings</span>
+      </div>
+    </div>
+
+  </section>
+</div>
+</body>
+</html>

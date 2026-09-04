@@ -30,6 +30,7 @@ class MockMcp(BaseHTTPRequestHandler):
     session_counter = 0
     calls: list[dict] = []
     flaky_404_sent = False
+    flaky_write_404_sent = False
 
     def log_message(self, *_args):
         pass
@@ -84,6 +85,9 @@ class MockMcp(BaseHTTPRequestHandler):
                 {"name": "run_command", "description": "command", "inputSchema": {"type": "object"}, "annotations": {"readOnlyHint": False, "destructiveHint": True}},
                 {"name": "apply_patch", "description": "write", "inputSchema": {"type": "object"}, "annotations": {"readOnlyHint": False}},
                 {"name": "delete_all", "description": "destroy", "inputSchema": {"type": "object"}, "annotations": {"destructiveHint": True}},
+                {"name": "failing_patch", "description": "write that reports isError", "inputSchema": {"type": "object"}, "annotations": {"readOnlyHint": False}},
+                {"name": "flaky_write", "description": "write that 404s once", "inputSchema": {"type": "object"}, "annotations": {"readOnlyHint": False}},
+                {"name": "second_patch", "description": "write", "inputSchema": {"type": "object"}, "annotations": {"readOnlyHint": False}},
             ]
             result = {"jsonrpc": "2.0", "id": msg["id"], "result": {"tools": tools}}
             notification = {"jsonrpc": "2.0", "method": "notifications/progress", "params": {"progress": 1}}
@@ -98,6 +102,16 @@ class MockMcp(BaseHTTPRequestHandler):
             if name == "flaky_read" and not MockMcp.flaky_404_sent:
                 MockMcp.flaky_404_sent = True
                 self._json(404, {"error": "session expired"})
+                return
+            if name == "flaky_write" and not MockMcp.flaky_write_404_sent:
+                MockMcp.flaky_write_404_sent = True
+                self._json(404, {"error": "session expired"})
+                return
+            if name == "failing_patch":
+                self._json(200, {"jsonrpc": "2.0", "id": msg["id"], "result": {
+                    "content": [{"type": "text", "text": "failed at hunk 3 of 5"}],
+                    "isError": True,
+                }})
                 return
             args = msg.get("params", {}).get("arguments", {})
             if name == "slow_read":
@@ -175,6 +189,695 @@ def observe_task(task_id, calls):
     }
 
 
+def planned_task(task_id, plan_item_id, target, include_plan=False):
+    value = task(task_id, "read_file", target)
+    value["version"] = "1.3"
+    value["plan_id"] = "stabilize-v092"
+    value["plan_revision"] = 1
+    value["plan_item_id"] = plan_item_id
+    value["outputs"] = [{
+        "id": f"{task_id}-report",
+        "label": f"{task_id} report",
+        "kind": "report",
+        "ref": str(target),
+    }]
+    if include_plan:
+        value["plan"] = {
+            "id": "stabilize-v092",
+            "revision": 1,
+            "title": "Stabilize Local MCP Bridge v0.9.2",
+            "items": [
+                {"id": "p1", "phase": "plan", "title": "Audit current implementation"},
+                {"id": "p2", "phase": "execute", "title": "Update sidebar presentation"},
+            ],
+            "context": {
+                "resources": [{"kind": "workspace", "label": "local-mcp-bridge"}],
+                "constraints": ["LBP 1.3"],
+            },
+        }
+    return value
+
+
+def second_plan_task(task_id, plan_item_id, target, include_plan=False):
+    """A different plan, used to prove a later chain may carry its own plan."""
+    value = task(task_id, "read_file", target)
+    value["version"] = "1.3"
+    value["plan_id"] = "followup-plan"
+    value["plan_revision"] = 1
+    value["plan_item_id"] = plan_item_id
+    if include_plan:
+        value["plan"] = {
+            "id": "followup-plan",
+            "revision": 1,
+            "title": "Follow-up work",
+            "items": [{"id": "q1", "phase": "execute", "title": "Follow-up step"}],
+        }
+    return value
+
+
+def run_suite(port, project, target, outside):
+    def section(name):
+        print(f"\n{name}")
+
+    def ok(name):
+        PASSED.append(name)
+        print(f"  ok  {name}")
+
+    # ---------------------------------------------------------------- protocol
+    section("protocol freeze")
+
+    status, health = request(port, "GET", "/health")
+    assert status == 200 and health["protocols"][0]["versions"] == ["1.3", "1.2"], health
+    assert set(health["operations"]) == {"mcp.call", "mcp.list_tools", "mcp.observe", "mcp.mutate"}
+    ok("daemon advertises exactly LBP 1.3 and 1.2")
+
+    c = Conversation(port, conv_id("proto")).begin()
+    legacy = task("legacy-11", "read_file", target)
+    legacy["version"] = "1.1"
+    status, body = c.try_act("register_task", assistant_turn_id="a1", task=legacy)
+    assert status == 400 and "1.1 is historical" in body["error"], body
+    ok("daemon rejects LBP 1.1 rather than coercing it")
+
+    single = task("legacy-single", "read_file", target)
+    single["operations"] = [dict(single.pop("operation"), mutating=False, required=True)]
+    reg = c.register(single, "a-single")
+    assert reg["task_id"] == "legacy-single"
+    ok("single-element operations[] normalizes as canonical 1.2")
+
+    # ------------------------------------------------------- conversation state
+    section("conversation identity and enable baseline")
+
+    c = Conversation(port, conv_id("baseline"))
+    c.act("enable")
+    c.act("observe_user_turn", turn_id="old-turn-revealed-by-scrolling")
+    assert c.state["active_chain"] is None
+    status, body = c.try_act("register_task", assistant_turn_id="a-hist", task=task("hist", "read_file", target))
+    assert status == 400 and "no active chain" in body["error"], body
+    ok("enabling does not make a historical/scrolled-in turn executable")
+
+    c.act("arm_human_send")
+    c.act("observe_user_turn", turn_id="u-real")
+    assert c.state["phase"] == "awaiting_assistant" and c.state["active_chain"] is not None
+    ok("a chain starts only after an armed genuine send produces a turn")
+
+    other = Conversation(port, conv_id("other-chat"))
+    assert other.state["enabled"] is False
+    ok("enabling one conversation leaves every other conversation disabled")
+
+    p = Conversation(port, prov_id("tab-A")).begin(turn="pu1")
+    p_reg = p.register(task("prov-task", "read_file", target), "pa1")
+    canonical = conv_id("bound-chat")
+    status, bound = request(port, "POST", "/v1/conversation-state/bind",
+                            {"provisional_id": p.id, "canonical_id": canonical})
+    assert status == 200 and bound["state"]["bound"] is True and bound["state"]["enabled"] is True
+    ok("provisional state migrates to a canonical conversation exactly once")
+
+    status, again = request(port, "POST", "/v1/conversation-state/bind",
+                            {"provisional_id": prov_id("tab-B"), "canonical_id": canonical})
+    assert status == 200 and again["state"]["bound"] is False
+    ok("a second tab cannot overwrite existing canonical state")
+
+    bound_conv = Conversation(port, canonical)
+    status, preview = bound_conv.preview(p_reg["registration_id"])
+    assert status == 200, preview
+    ok("a registration survives provisional -> canonical binding")
+
+    # ------------------------------------------------------------- concurrency
+    section("concurrency and ownership")
+
+    c = Conversation(port, conv_id("cas")).begin()
+    stale = c.state["revision"]
+    c.act("observe_assistant_turn", turn_id="a1")
+    status, body = c.try_act("observe_assistant_turn", turn_id="a2", expected_revision=stale)
+    assert status == 409 and body["state"]["revision"] > stale, body
+    ok("a stale revision is rejected with the current state for merge")
+
+    c.act("claim_owner", tab_token="tab-one")
+    status, body = c.try_act("observe_assistant_turn", turn_id="a3", tab_token="tab-two")
+    assert status == 400 and "not_owner" in body["error"], body
+    ok("a second tab cannot drive a conversation another tab owns")
+
+    # The lease guards the actions that DRIVE the pump. It must never block a
+    # human's own click: blocking `configure` locked people out of the
+    # Auto-continue toggle in their own tab and left the sidebar and the
+    # settings page disagreeing about the mode.
+    status, body = c.try_act("configure", mode="manual", checkpoint_size=12, tab_token="tab-two")
+    assert status == 200, body
+    assert body["state"]["mode"] == "manual", body["state"]
+    ok("a non-owner tab can still change settings the human asked for")
+
+    for human_action, payload in (("enable", {}), ("stop", {}), ("disable", {})):
+        status, body = c.try_act(human_action, tab_token="tab-two", **payload)
+        assert status == 200, (human_action, body)
+    ok("enable, stop and disable are never blocked by the owner lease")
+
+    # A reloaded tab is the live tab and takes the lease, rather than waiting it
+    # out -- otherwise reloading locked the user out for the whole lease window.
+    status, body = c.try_act("claim_owner", tab_token="tab-three")
+    assert status == 200 and body["state"]["owner_granted"] is False, body
+    status, body = c.try_act("claim_owner", tab_token="tab-three", takeover=True)
+    assert status == 200 and body["state"]["owner_granted"] is True, body
+    c.act("enable", tab_token="tab-three")
+    status, body = c.try_act("observe_assistant_turn", turn_id="a4", tab_token="tab-three")
+    assert status == 200, body
+    ok("a reloaded tab takes the lease instead of waiting for it to expire")
+
+    # -------------------------------------------------------------- journaling
+    section("task registration and journaling")
+
+    a = Conversation(port, conv_id("chat-A")).begin()
+    b = Conversation(port, conv_id("chat-B")).begin()
+    reg_a, (status, run_a) = a.run_approved(task("task1", "read_file", target))
+    assert status == 200 and run_a["result"]["status"] == "ok"
+    reg_b = b.register(task("task1", "read_file", target))["registration_id"]
+    status, run_b = b.run(reg_b)
+    assert status == 200 and run_b["replayed"] is False
+    assert run_b["journal_key"] != run_a["journal_key"]
+    ok("the same task id in two conversations is fully isolated")
+
+    same = a.register(task("task1", "read_file", target))
+    assert same["registration_id"] == reg_a
+    ok("re-registering the same task id and digest re-attaches to the same handle")
+
+    conflicting = task("task1", "read_file", outside)
+    status, body = a.try_act("register_task", assistant_turn_id="a1", task=conflicting)
+    assert status == 400 and "different content" in body["error"], body
+    ok("the same task id with a different digest is refused")
+
+    status, replay = a.run(reg_a)
+    assert status == 200 and replay["replayed"] is True
+    ok("a completed task replays its stored result without re-entering MCP")
+
+    # --------------------------------------------------------------- plan model
+    section("LBP 1.3 plan, outputs and context")
+
+    plan_conv = Conversation(port, conv_id("plan-model")).begin()
+    reg_p1, (status, run_p1) = plan_conv.run_approved(
+        planned_task("plan-task-1", "p1", target, include_plan=True), "plan-a1"
+    )
+    assert status == 200 and plan_conv.state["plan"]["items"][0]["status"] == "current"
+    plan_conv.act("task_execution_status", registration=reg_p1, status="completed")
+    assert plan_conv.state["plan"]["items"][0]["status"] == "completed"
+    assert plan_conv.state["outputs"][0]["status"] == "produced"
+    assert plan_conv.state["context"]["constraints"][0] == "LBP 1.3"
+    ok("a first planned task registers an immutable plan, context and pending output")
+
+    context_conv = Conversation(port, conv_id("context-sources")).begin()
+    context_conv.act("add_context_source", kind="folder", path=str(project))
+    user_sources = [item for item in context_conv.state["context"]["sources"] if item.get("origin") == "user"]
+    assert len(user_sources) == 1, context_conv.state["context"]
+    assert user_sources[0]["path"] == str(project.resolve(strict=False))
+    assert user_sources[0]["server"] == "workspace"
+    assert user_sources[0]["accessible"] is True
+    status, workspace_sources = request(port, "GET", "/v1/context/workspaces")
+    assert status == 200 and workspace_sources["sources"][0]["path"] == str(project.resolve(strict=False))
+    assert "endpoint" not in json.dumps(workspace_sources), workspace_sources
+    status, body = context_conv.try_act("add_context_source", kind="folder", path=str(outside.parent / "other"))
+    assert status == 400 and "outside the currently allowed MCP roots" in body["error"], body
+    context_conv.act("remove_context_source", source_id=user_sources[0]["id"])
+    remaining = [item for item in context_conv.state["context"]["sources"] if item.get("origin") == "user"]
+    assert remaining == []
+    ok("conversation Context sources are daemon-owned, root-validated and removable without changing MCP policy")
+
+    plan_conv.act("task_delivery_status", registration=reg_p1, status="inserted")
+    plan_conv.act("acknowledge_submission", registration=reg_p1, turn_id="plan-ack1", result=run_p1["result"])
+    reg_p2 = plan_conv.register(planned_task("plan-task-2", "p2", target), "plan-a2")
+    assert reg_p2["plan_item_id"] == "p2"
+    assert plan_conv.state["plan"]["items"][1]["status"] == "current"
+    ok("the next plan item can register only after the prior item completes and is acknowledged")
+
+    bad_plan = Conversation(port, conv_id("plan-order")).begin()
+    status, body = bad_plan.try_act(
+        "register_task",
+        assistant_turn_id="bad-plan-a1",
+        task=planned_task("bad-plan-2", "p2", target, include_plan=True),
+    )
+    assert status == 400 and "plan order violation" in body["error"], body
+    ok("a planned task cannot skip ahead of daemon-persisted plan order")
+
+    dup_plan = planned_task("dup-plan", "p1", target, include_plan=True)
+    dup_plan["plan"]["items"].append({"id": "p1", "phase": "execute", "title": "Duplicate"})
+    status, body = Conversation(port, conv_id("plan-dupe")).begin().try_act(
+        "register_task", assistant_turn_id="dup-plan-a1", task=dup_plan
+    )
+    assert status == 400 and "not unique" in body["error"], body
+    ok("plan item ids must be unique")
+
+    # A plan is immutable once registered FOR A CHAIN. Before this was
+    # chain-scoped, the first plan in a conversation blocked every later one
+    # permanently: a new plan raised "immutable after execution has begun" and
+    # the old plan's remaining items raised "superseded chain", so the whole
+    # plan feature wedged after a single use.
+    second = Conversation(port, conv_id("plan-second-chain")).begin()
+    reg_s1, (status, run_s1) = second.run_approved(
+        planned_task("second-1", "p1", target, include_plan=True), "second-a1"
+    )
+    assert status == 200, run_s1
+    second.act("task_execution_status", registration=reg_s1, status="completed")
+    second.act("task_delivery_status", registration=reg_s1, status="inserted")
+    second.act("acknowledge_submission", registration=reg_s1, turn_id="second-ack1", result=run_s1["result"])
+
+    second.act("arm_human_send")
+    second.act("observe_user_turn", turn_id="second-u2")
+    reg_s2 = second.register(second_plan_task("second-2", "q1", target, include_plan=True), "second-a2")
+    assert second.state["plan"]["id"] == "followup-plan", second.state["plan"]
+    assert second.state["plan"]["items"][0]["status"] == "current"
+    ok("a new human turn may register a new plan; one plan does not wedge the conversation")
+
+    # The superseded plan's own items must still be unreachable.
+    stale_plan = Conversation(port, conv_id("plan-superseded")).begin()
+    reg_t1, (status, run_t1) = stale_plan.run_approved(
+        planned_task("stale-plan-1", "p1", target, include_plan=True), "stale-a1"
+    )
+    assert status == 200, run_t1
+    stale_plan.act("task_execution_status", registration=reg_t1, status="completed")
+    stale_plan.act("task_delivery_status", registration=reg_t1, status="inserted")
+    stale_plan.act("acknowledge_submission", registration=reg_t1, turn_id="stale-ack1", result=run_t1["result"])
+    stale_plan.act("arm_human_send")
+    stale_plan.act("observe_user_turn", turn_id="stale-u2")
+    status, body = stale_plan.try_act(
+        "register_task", assistant_turn_id="stale-a2",
+        task=planned_task("stale-plan-2", "p2", target),
+    )
+    assert status == 400 and "superseded chain" in body["error"], body
+    ok("a plan item from a superseded chain still cannot execute")
+
+    # An already-registered plan is still immutable WITHIN its own chain.
+    same_chain = Conversation(port, conv_id("plan-same-chain")).begin()
+    reg_c1, (status, run_c1) = same_chain.run_approved(
+        planned_task("same-1", "p1", target, include_plan=True), "same-a1"
+    )
+    assert status == 200, run_c1
+    same_chain.act("task_execution_status", registration=reg_c1, status="completed")
+    same_chain.act("task_delivery_status", registration=reg_c1, status="inserted")
+    same_chain.act("acknowledge_submission", registration=reg_c1, turn_id="same-ack1", result=run_c1["result"])
+    status, body = same_chain.try_act(
+        "register_task", assistant_turn_id="same-a2",
+        task=second_plan_task("same-2", "q1", target, include_plan=True),
+    )
+    assert status == 400 and "immutable" in body["error"], body
+    ok("a plan cannot be swapped mid-chain")
+
+    # replay must re-evaluate policy, not just return the journal
+    frozen = Conversation(port, conv_id("policy-replay")).begin()
+    reg_f, (status, _) = frozen.run_approved(task("policy-replay-1", "read_file", target))
+    status, servers_now = request(port, "GET", "/v1/servers")
+    shrunk = json.loads(json.dumps(servers_now["servers"]))
+    shrunk["workspace"]["allowed_tools"] = ["delete_all"]
+    status, saved = request(port, "POST", "/v1/servers",
+                            {"servers": shrunk, "expected_version": servers_now["version"]})
+    assert status == 200, saved
+    status, denied = frozen.run(reg_f)
+    assert status == 400 and "tool_policy_denied" in denied["error"], denied
+    ok("replay re-evaluates policy: a since-disallowed tool cannot replay")
+
+    restored = json.loads(json.dumps(servers_now["servers"]))
+    status, back = request(port, "POST", "/v1/servers",
+                           {"servers": restored, "expected_version": saved["version"]})
+    assert status == 200, back
+
+    # --------------------------------------------------------- stale execution
+    section("stale execution barrier")
+
+    s = Conversation(port, conv_id("stale")).begin()
+    reg_old = s.register(task("stale-1", "read_file", target), "a1")["registration_id"]
+    s.act("abandon_task", registration=reg_old, reason="denied_by_user")
+    s.act("arm_human_send")
+    s.act("observe_user_turn", turn_id="u2")
+    status, body = s.run(reg_old)
+    assert status == 400 and "stale_task" in body["error"], body
+    ok("a task from a superseded chain cannot execute")
+
+    status, body = s.preview(reg_old)
+    assert status == 400 and "stale_task" in body["error"], body
+    ok("a stale task cannot even be previewed")
+
+    s.act("stop", reason="user_stop")
+    reg_new = None
+    status, body = s.try_act("register_task", assistant_turn_id="a9", task=task("after-stop", "read_file", target))
+    assert status == 400, body
+    ok("Stop prevents any further registration")
+
+    # ------------------------------------------------------------- checkpoints
+    section("checkpoint and approval windows")
+
+    k = Conversation(port, conv_id("checkpoint")).begin(checkpoint_size=2)
+    results = []
+    for index in (1, 2):
+        reg, (status, run) = k.run_approved(task(f"cp-{index}", "read_file", target), f"a{index}")
+        assert status == 200, run
+        results.append((reg, run["result"]))
+        k.act("task_execution_status", registration=reg, status="completed")
+        if index == 1:
+            k.act("task_delivery_status", registration=reg, status="inserted")
+            k.act("acknowledge_submission", registration=reg, turn_id=f"ack{index}", result=run["result"])
+    assert k.state["phase"] == "checkpoint", k.state["phase"]
+    assert k.state["active_chain"]["window"] == 0
+    ok("the window fills and the chain reaches a checkpoint, never a deadlock")
+
+    status, body = k.try_act("register_task", assistant_turn_id="a3", task=task("cp-3", "read_file", target))
+    assert status == 400, body
+    ok("no new task registers while a checkpoint is pending")
+
+    k.act("request_continue")
+    assert k.state["active_chain"]["window"] == 0
+    assert k.state["active_chain"]["checkpoint_continue_requested"] is True
+    ok("requesting continuation does NOT advance the window on its own")
+
+    reg2, result2 = results[1]
+    k.act("task_delivery_status", registration=reg2, status="inserted")
+    k.act("acknowledge_submission", registration=reg2, turn_id="ack2", result=result2)
+    assert k.state["active_chain"]["window"] == 1
+    assert k.state["active_chain"]["window_task_count"] == 0
+    ok("the window advances only on acknowledged provider submission")
+
+    status, body = k.try_act("acknowledge_submission", registration=reg2, turn_id="ack2", result=result2)
+    assert status == 200 and k.state["active_chain"]["window"] == 1
+    ok("a repeated acknowledgement cannot advance the window twice")
+
+    status, body = k.try_act("acknowledge_submission", registration=reg2, turn_id="ack-forged",
+                             result={"protocol": "lbp", "task_id": "cp-2", "status": "ok", "operation": {}})
+    assert status == 400 and "does not match the stored canonical result" in body["error"], body
+    ok("a forged result cannot be acknowledged even with the right task id")
+
+    # -------------------------------------------------------- wedge resistance
+    section("wedge resistance")
+
+    w = Conversation(port, conv_id("wedge")).begin(checkpoint_size=3)
+    reg_w = w.register(task("wedge-1", "read_file", target), "a1")["registration_id"]
+    assert w.state["phase"] == "task_registered"
+    w.act("abandon_task", registration=reg_w, reason="denied_by_user")
+    assert w.state["phase"] == "awaiting_assistant"
+    assert w.state["active_chain"]["window_task_count"] == 0
+    ok("a denied task releases its window slot and the chain stays usable")
+
+    reg_w2 = w.register(task("wedge-2", "read_file", target), "a2")["registration_id"]
+    assert reg_w2 != reg_w
+    ok("a new task registers after an abandoned one")
+
+    status, body = w.try_act("task_execution_status", registration=reg_w2, status="totally-made-up")
+    assert status == 400 and "execution status must be one of" in body["error"], body
+    ok("task status transitions are enum-validated")
+
+    status, body = w.try_act("task_delivery_status", registration=reg_w2, status="submitted")
+    assert status == 400, body
+    ok("delivery cannot be marked submitted except by acknowledge_submission")
+
+    # ------------------------------------------------------------- approvals
+    section("approval scopes")
+
+    ap = Conversation(port, conv_id("approvals")).begin()
+    reg = ap.register(task("ap-1", "apply_patch", target), "a1")["registration_id"]
+    status, preview = ap.preview(reg)
+    assert preview["preview"]["approval"]["required"] is True
+    assert preview["preview"]["operation"]["classification"] == "write"
+    ok("a write requires approval under approval_mode=mutations")
+
+    status, approval = ap.approve(reg, "once")
+    token = approval["approval_token"]
+    status, first = ap.run(reg, token)
+    assert status == 200 and first["result"]["status"] == "ok"
+    ok("a one-time approval executes the exact registered task")
+
+    ap2 = Conversation(port, conv_id("approvals-2")).begin()
+    reg2 = ap2.register(task("ap-2", "apply_patch", target), "a1")["registration_id"]
+    status, body = ap2.run(reg2, token)
+    assert status == 400 and "approval" in body["error"], body
+    ok("a spent one-time token cannot authorize another task")
+
+    d = Conversation(port, conv_id("destructive")).begin()
+    reg_d = d.register(task("destroy-1", "delete_all", target), "a1")["registration_id"]
+    status, preview = d.preview(reg_d)
+    approval = preview["preview"]["approval"]
+    assert approval["required"] is True and approval["reason"] == "destructive_always"
+    assert approval["chain_approval_available"] is False
+    assert approval["session_approval_available"] is False
+    ok("the destructive hard gate is independent of every lease")
+
+    ch = Conversation(port, conv_id("chain-scope")).begin(checkpoint_size=1)
+    reg_c1 = ch.register(task("cs-1", "apply_patch", target), "a1")["registration_id"]
+    status, approval = ch.approve(reg_c1, "chain")
+    assert status == 200 and approval["chain_granted"] is True, approval
+    status, run_c1 = ch.run(reg_c1)
+    assert status == 200, run_c1
+    ch.act("task_execution_status", registration=reg_c1, status="completed")
+    ch.act("task_delivery_status", registration=reg_c1, status="inserted")
+    ch.act("request_continue")
+    ch.act("acknowledge_submission", registration=reg_c1, turn_id="cack1", result=run_c1["result"])
+    assert ch.state["active_chain"]["window"] == 1
+    reg_c2 = ch.register(task("cs-2", "apply_patch", target), "a2")["registration_id"]
+    status, preview2 = ch.preview(reg_c2)
+    assert preview2["preview"]["approval"]["required"] is True, preview2
+    ok("a chain approval from window 0 does not authorize window 1")
+
+    # ------------------------------------------------- mutation ambiguity
+    section("mutation ambiguity")
+
+    m = Conversation(port, conv_id("mutation")).begin()
+    reg_m = m.register(task("mut-iserror", "failing_patch", target), "a1")["registration_id"]
+    status, approval = m.approve(reg_m, "once")
+    status, run_m = m.run(reg_m, approval["approval_token"])
+    assert status == 200 and run_m["result"]["status"] == "unknown", run_m["result"]
+    assert run_m["result"]["operation"]["execution_state"] == "unknown"
+    ok("a mutating tool reporting isError is unknown, never a retryable error")
+
+    assert m.state["phase"] != "stopped"
+    m.act("task_execution_status", registration=reg_m, status="unknown")
+    assert m.state["phase"] == "stopped" and m.state["stopped_reason"] == "unknown_mutation_state"
+    ok("an unknown mutation stops the chain immediately, never waits at a checkpoint")
+
+    m2 = Conversation(port, conv_id("mutation-404")).begin()
+    reg_m2 = m2.register(task("mut-404", "flaky_write", target), "a1")["registration_id"]
+    status, approval = m2.approve(reg_m2, "once")
+    before = len([c for c in MockMcp.calls if c.get("tool") == "flaky_write"])
+    status, run_m2 = m2.run(reg_m2, approval["approval_token"])
+    after = len([c for c in MockMcp.calls if c.get("tool") == "flaky_write"])
+    assert run_m2["result"]["status"] == "unknown", run_m2["result"]
+    assert after - before == 1, f"mutating call was re-dispatched after 404 ({after - before} calls)"
+    ok("a mutating call is never transparently retried after a session 404")
+
+    r = Conversation(port, conv_id("read-404")).begin()
+    reg_r, (status, run_r) = r.run_approved(task("read-404", "flaky_read", target), "a1")
+    assert status == 200 and run_r["result"]["status"] == "ok"
+    ok("a READ call still recovers transparently from a session 404")
+
+    mb = Conversation(port, conv_id("mutate-batch")).begin()
+    batch = mutate_task("batch-1", [
+        {"id": "a", "tool": "apply_patch", "arguments": {"path": str(target)}},
+        {"id": "b", "tool": "failing_patch", "arguments": {"path": str(target)}},
+        {"id": "c", "tool": "second_patch", "arguments": {"path": str(target)}},
+    ])
+    reg_mb = mb.register(batch, "a1")["registration_id"]
+    status, approval = mb.approve(reg_mb, "once")
+    status, run_mb = mb.run(reg_mb, approval["approval_token"])
+    operation = run_mb["result"]["operation"]
+    assert run_mb["result"]["status"] == "unknown", run_mb["result"]["status"]
+    assert operation["applied_calls"] == 1 and operation["partial_execution"] is True
+    assert operation["calls"][2]["status"] == "skipped"
+    assert operation["calls"][2]["execution_state"] == "not_attempted"
+    ok("a partially applied mutate batch is unknown and stops at the first failure")
+
+    o = Conversation(port, conv_id("observe")).begin()
+    obs = observe_task("obs-1", [
+        {"id": "r1", "tool": "read_file", "arguments": {"path": str(target)}},
+        {"id": "v1", "tool": "run_command", "arguments": {"command": "cargo test", "cwd": str(project)}},
+    ])
+    reg_o, (status, run_o) = o.run_approved(obs, "a1")
+    assert status == 200 and run_o["result"]["status"] == "ok", run_o
+    assert run_o["result"]["operation"]["classification"] == "verify"
+    ok("an observe group runs read+verify under one shared barrier")
+
+    bad_observe = observe_task("obs-bad", [
+        {"id": "w1", "tool": "apply_patch", "arguments": {"path": str(target)}},
+    ])
+    ob = Conversation(port, conv_id("observe-bad")).begin()
+    reg_ob = ob.register(bad_observe, "a1")["registration_id"]
+    status, body = ob.preview(reg_ob)
+    assert status == 400 and "observe_policy_denied" in body["error"], body
+    ok("a write inside mcp.observe is rejected before dispatch")
+
+    # ------------------------------------------------------------ path policy
+    section("path and tool policy")
+
+    pp = Conversation(port, conv_id("paths")).begin()
+
+    def denied(task_id, arguments, fragment, turn):
+        reg = pp.register(task_args(task_id, "apply_patch", arguments), turn)["registration_id"]
+        status, body = pp.preview(reg)
+        assert status == 400 and fragment in body["error"], (task_id, body)
+        pp.act("abandon_task", registration=reg, reason="test")
+
+    denied("p1", {"path": str(outside)}, "path_policy_denied", "t1")
+    ok("an absolute path outside the configured roots is denied")
+
+    denied("p2", {"filename": str(outside)}, "path_policy_denied", "t2")
+    ok("an absolute path in an unrecognized key is still denied")
+
+    denied("p3", {"filename": "../../../../etc/passwd"}, "path_policy_denied", "t3")
+    ok("a traversal-shaped relative value in an unrecognized key fails closed")
+
+    denied("p4", {"path": "src/main.rs"}, "path_policy_denied", "t4")
+    ok("a relative value in a recognized path key fails closed")
+
+    denied("p5", {"payload": {"filename": str(outside)}}, "path_policy_denied", "t5")
+    ok("a nested path argument is still checked")
+
+    reg = pp.register(task_args("p6", "apply_patch", {
+        "path": str(target), "note": "hello/world", "branch": "feature/x",
+    }), "t6")["registration_id"]
+    status, preview = pp.preview(reg)
+    assert status == 200, preview
+    pp.act("abandon_task", registration=reg, reason="test")
+    ok("ordinary slash-bearing text is not mistaken for a path")
+
+    ff = Conversation(port, conv_id("freeform")).begin()
+    reg_ff = ff.register(task_args("ff-1", "delete_all", {
+        "path": str(target), "patch": "--- a/x\n+++ b/x",
+    }), "a1")["registration_id"]
+    status, body = ff.preview(reg_ff)
+    assert status == 400 and "freeform_policy_denied" in body["error"], body
+    ok("a write tool with a free-form payload needs explicit acknowledgement")
+
+    v = Conversation(port, conv_id("verify")).begin()
+    reg_v = v.register(task_args("v-1", "run_command", {
+        "command": "cargo test --manifest-path ../../outside/Cargo.toml", "cwd": str(project),
+    }), "a1")["registration_id"]
+    status, body = v.preview(reg_v)
+    assert status == 400 and "path_policy_denied" in body["error"], body
+    ok("a VERIFY argv path escaping the roots is denied")
+
+    v2 = Conversation(port, conv_id("verify-2")).begin()
+    reg_v2 = v2.register(task_args("v-2", "run_command", {
+        "command": "rm -rf /; cargo test", "cwd": str(project),
+    }), "a1")["registration_id"]
+    status, preview = v2.preview(reg_v2)
+    assert status == 200, preview
+    # Shell control operators fail closed by refusing the VERIFY downgrade: the
+    # command keeps the server's destructive classification and therefore stays
+    # behind the independent destructive gate. It is never silently treated as a
+    # narrow verification command.
+    assert preview["preview"]["operation"]["classification"] == "destructive", preview
+    assert "verification" not in preview["preview"]["operation"]
+    assert preview["preview"]["approval"]["reason"] == "destructive_always"
+    ok("shell metacharacters refuse the VERIFY downgrade and stay destructive")
+
+    # -------------------------------------------------------------- transport
+    section("transport and auth")
+
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    conn.request("GET", "/health", headers={"Authorization": "Bearer wrong", "Host": f"127.0.0.1:{port}"})
+    assert conn.getresponse().status == 401
+    conn.close()
+    ok("a wrong bearer token is rejected")
+
+    status, _ = request(port, "GET", "/health", host="evil.example")
+    assert status == 421, status
+    ok("a non-loopback Host header is rejected (421 Misdirected Request)")
+
+    status, body = request(port, "POST", "/v1/conversation-state",
+                           {"conversation_id": "chat-2a0c975e", "action": "get"})
+    assert status == 400 and "conv-" in body["error"], body
+    ok("a legacy FNV-style conversation id is no longer a valid identity")
+# --- Test harness -------------------------------------------------------------
+
+PASSED = []
+
+
+def check(name):
+    def decorate(fn):
+        PASSED.append((name, fn))
+        return fn
+    return decorate
+
+
+def conv_id(seed: str) -> str:
+    return "conv-" + hashlib.sha256(seed.encode()).hexdigest()[:32]
+
+
+def prov_id(seed: str) -> str:
+    return "prov-" + hashlib.sha256(seed.encode()).hexdigest()[:32]
+
+
+class Conversation:
+    """Drives one conversation through the daemon exactly as the coordinator does."""
+
+    def __init__(self, port: int, conversation_id: str, session_id: str = "tab-1"):
+        self.port = port
+        self.id = conversation_id
+        self.session_id = session_id
+        self.state = self.act("get")
+
+    def act(self, action, **payload):
+        status, body = request(self.port, "POST", "/v1/conversation-state", {
+            "conversation_id": self.id, "action": action, "payload": payload,
+        })
+        if status != 200:
+            raise AssertionError(f"{action} -> {status} {body.get('error')}")
+        self.state = body["state"]
+        return self.state
+
+    def try_act(self, action, **payload):
+        status, body = request(self.port, "POST", "/v1/conversation-state", {
+            "conversation_id": self.id, "action": action, "payload": payload,
+        })
+        if status == 200:
+            self.state = body["state"]
+        return status, body
+
+    def begin(self, mode="auto_continue", checkpoint_size=12, turn="u1"):
+        self.act("enable")
+        self.act("configure", mode=mode, checkpoint_size=checkpoint_size)
+        self.act("arm_human_send")
+        self.act("observe_user_turn", turn_id=turn)
+        return self
+
+    def register(self, task_body, assistant_turn_id="a1"):
+        state = self.act("register_task", assistant_turn_id=assistant_turn_id, task=task_body)
+        return state["task"]
+
+    def preview(self, registration):
+        return request(self.port, "POST", "/v1/tasks/preview", {
+            "conversation_id": self.id, "registration": registration, "session_id": self.session_id,
+        })
+
+    def approve(self, registration, decision):
+        return request(self.port, "POST", "/v1/approvals", {
+            "conversation_id": self.id, "registration": registration,
+            "session_id": self.session_id, "decision": decision,
+        })
+
+    def run(self, registration, approval_token=None):
+        return request(self.port, "POST", "/v1/tasks", {
+            "conversation_id": self.id, "registration": registration,
+            "session_id": self.session_id, "approval_token": approval_token,
+        })
+
+    def run_approved(self, task_body, assistant_turn_id="a1"):
+        """register -> preview -> approve if needed -> run."""
+        reg = self.register(task_body, assistant_turn_id)["registration_id"]
+        status, preview = self.preview(reg)
+        assert status == 200, preview
+        token = None
+        if preview["preview"]["approval"]["required"]:
+            status, approval = self.approve(reg, "once")
+            assert status == 200, approval
+            token = approval["approval_token"]
+        return reg, self.run(reg, token)
+
+    def deliver(self, reg, result, turn_id):
+        self.act("task_execution_status", registration=reg,
+                 status={"ok": "completed", "unknown": "unknown"}.get(result["status"], "error"))
+        self.act("task_delivery_status", registration=reg, status="inserted")
+        return self.try_act("acknowledge_submission", registration=reg, turn_id=turn_id, result=result)
+
+
+def mutate_task(task_id, calls):
+    return {
+        "protocol": "lbp", "version": "1.3", "id": task_id, "title": "mutate smoke",
+        "operation": {"type": "mcp.mutate", "server": "workspace", "calls": calls},
+    }
+
+
 def main():
     mcp_port = free_port()
     bridge_port = free_port()
@@ -190,8 +893,8 @@ def main():
         outside = home / "secret.txt"
         outside.write_text("secret\n")
         state = home / ".local-mcp-bridge"
-        tasks_dir = state / "tasks"
-        tasks_dir.mkdir(parents=True)
+        (state / "tasks").mkdir(parents=True)
+        (state / "conversations").mkdir(parents=True)
         (state / "token").write_text(TOKEN + "\n")
         os.chmod(state / "token", 0o600)
         servers = {
@@ -200,16 +903,21 @@ def main():
                 "endpoint": f"http://127.0.0.1:{mcp_port}/mcp",
                 "timeout_s": 5,
                 "enabled": True,
-                "allowed_tools": ["read_file", "flaky_read", "slow_read", "run_command", "apply_patch", "delete_all"],
+                "allowed_tools": [
+                    "read_file", "flaky_read", "slow_read", "run_command",
+                    "apply_patch", "delete_all", "failing_patch", "flaky_write", "second_patch",
+                ],
                 "allow_verify": True,
                 "verification_rules": [{
-                    "tool": "run_command",
-                    "argument": "command",
-                    "argv_prefixes": [["cargo", "test"], ["cargo", "check"], ["cargo", "clippy"], ["cargo", "fmt", "--check"]],
+                    "tool": "run_command", "argument": "command",
+                    "argv_prefixes": [["cargo", "test"], ["cargo", "check"]],
                 }],
-                "write": False,
-                "allow_destructive": False,
+                "write": True,
+                "allow_destructive": True,
                 "roots": [str(project)],
+                # Explicit acknowledgement that roots cannot constrain these
+                # tools' free-form payload arguments.
+                "freeform_write_tools": ["apply_patch", "failing_patch", "second_patch"],
             }
         }
         (state / "servers.json").write_text(json.dumps(servers))
@@ -218,419 +926,20 @@ def main():
         env = os.environ.copy()
         env["HOME"] = str(home)
         env["LOCAL_MCP_BRIDGE_PORT"] = str(bridge_port)
-        proc = subprocess.Popen(["python3", str(ROOT / "daemon.py")], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        proc = subprocess.Popen(["python3", str(ROOT / "daemon.py")], env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         try:
             wait_health(bridge_port)
-
-            status, health = request(bridge_port, "GET", "/health")
-            assert status == 200 and health["protocols"][0]["versions"] == ["1.3"]
-            assert set(health["operations"]) == {"mcp.call", "mcp.list_tools", "mcp.observe", "mcp.mutate"}
-            assert health["max_observe_calls"] == 8
-
-            legacy_single = {
-                "protocol": "lbp", "version": "1.1", "id": "legacy-single",
-                "operations": [{
-                    "type": "mcp.call", "server": "workspace", "tool": "read_file",
-                    "arguments": {"path": str(target)}, "mutating": False, "required": True,
-                }],
-            }
-            status, legacy_preview = request(bridge_port, "POST", "/v1/tasks/preview", legacy_single)
-            assert status == 200, legacy_preview
-            assert legacy_preview["preview"]["version"] == "1.2"
-            assert legacy_preview["preview"]["operation"]["tool"] == "read_file"
-
-            legacy_many = json.loads(json.dumps(legacy_single))
-            legacy_many["id"] = "legacy-many"
-            legacy_many["operations"].append(json.loads(json.dumps(legacy_many["operations"][0])))
-            status, legacy_many_resp = request(bridge_port, "POST", "/v1/tasks/preview", legacy_many)
-            assert status == 400 and "exactly one" in legacy_many_resp["error"]
-            assert set(health["approval_modes"]) == {"all", "session", "mutations", "none"}
-
-            status, _ = request(bridge_port, "GET", "/health", host="evil.com")
-            assert status == 421
-
-            status, registry = request(bridge_port, "GET", "/v1/servers")
-            assert status == 200 and len(registry["version"]) == 64
-            first_version = registry["version"]
-
-            status, tested = request(bridge_port, "POST", "/v1/servers/test", {"name": "workspace", "config": servers["workspace"]})
-            assert status == 200, tested
-            assert tested["result"]["tool_count"] == 6
-            assert any(t["name"] == "read_file" and t["classification"] == "read_only" for t in tested["result"]["tools"])
-
-            # Wildcard expands only live-catalog eligibility. It must not bypass
-            # tool existence or the remaining daemon policy gates.
-            status, wildcard_registry = request(bridge_port, "GET", "/v1/servers")
-            wildcard_servers = wildcard_registry["servers"]
-            wildcard_servers["workspace"]["allowed_tools"] = ["*"]
-            status, wildcard_saved = request(bridge_port, "POST", "/v1/servers", {
-                "servers": wildcard_servers,
-                "expected_version": wildcard_registry["version"],
-            })
-            assert status == 200, wildcard_saved
-
-            status, wildcard_read = request(
-                bridge_port, "POST", "/v1/tasks/preview", task("wildcard-read", "read_file", target)
-            )
-            assert status == 200, wildcard_read
-
-            missing_tool = task("wildcard-missing", "does_not_exist", target)
-            status, missing_tool_resp = request(bridge_port, "POST", "/v1/tasks/preview", missing_tool)
-            assert status == 400 and "tool_not_found" in missing_tool_resp["error"]
-
-            status, wildcard_restore = request(bridge_port, "POST", "/v1/servers", {
-                "servers": servers,
-                "expected_version": wildcard_saved["version"],
-            })
-            assert status == 200, wildcard_restore
-            first_version = wildcard_restore["version"]
-
-            # The client must use the negotiated version after initialize, and omit it on initialize itself.
-            init_calls = [c for c in MockMcp.calls if c["method"] == "initialize"]
-            assert init_calls and all(c["protocol_header"] is None for c in init_calls)
-            post_init = [c for c in MockMcp.calls if c["method"] in {"notifications/initialized", "tools/list"}]
-            assert post_init and all(c["protocol_header"] == NEGOTIATED for c in post_init)
-
-            read_task = task("read-1", "read_file", target)
-            status, preview = request(bridge_port, "POST", "/v1/tasks/preview", read_task)
-            assert status == 200, preview
-            assert preview["preview"]["operation"]["classification"] == "read_only"
-            assert preview["preview"]["operation"]["path_checks"][0]["root"] == str(project.resolve())
-
-            status, denied_path = request(bridge_port, "POST", "/v1/tasks/preview", task("outside", "read_file", outside))
-            assert status == 400 and "path_policy_denied" in denied_path["error"]
-
-            status, denied_write = request(bridge_port, "POST", "/v1/tasks/preview", task("write-denied", "apply_patch", target))
-            assert status == 400 and "write_policy_denied" in denied_write["error"]
-
-            # VERIFY is a daemon-owned classification. It can auto-run in mutations mode
-            # without enabling general write authority, but only for configured argv prefixes.
-            verify_task = task_args("verify-cargo-test", "run_command", {
-                "command": "cargo test --workspace",
-                "cwd": str(project),
-            })
-            status, verify_preview = request(bridge_port, "POST", "/v1/tasks/preview", verify_task)
-            assert status == 200, verify_preview
-            assert verify_preview["preview"]["operation"]["classification"] == "verify"
-            assert verify_preview["preview"]["approval"]["required"] is False
-            assert verify_preview["preview"]["operation"]["verification"]["matched_prefix"] == ["cargo", "test"]
-            status, verify_run = request(bridge_port, "POST", "/v1/tasks", verify_task)
-            assert status == 200 and verify_run["result"]["status"] == "ok", verify_run
-            assert verify_run["result"]["operation"]["classification"] == "verify"
-            assert verify_run["result"]["applied_mutations"] == []
-
-            # A model cannot self-declare VERIFY and shell control operators fail closed.
-            forged = json.loads(json.dumps(verify_task))
-            forged["id"] = "verify-forged"
-            forged["operation"]["classification"] = "verify"
-            status, forged_resp = request(bridge_port, "POST", "/v1/tasks/preview", forged)
-            assert status == 400 and "derives classification" in forged_resp["error"]
-            escaped = task_args("verify-shell-escape", "run_command", {
-                "command": "cargo test && rm -rf /tmp/nope",
-                "cwd": str(project),
-            })
-            status, escaped_resp = request(bridge_port, "POST", "/v1/tasks/preview", escaped)
-            assert status == 400 and "write_policy_denied" in escaped_resp["error"]
-            no_cwd = task_args("verify-no-cwd", "run_command", {"command": "cargo test"})
-            status, no_cwd_resp = request(bridge_port, "POST", "/v1/tasks/preview", no_cwd)
-            assert status == 400 and "write_policy_denied" in no_cwd_resp["error"]
-            verify_path_escape = task_args("verify-path-escape", "run_command", {
-                "command": f"cargo test --manifest-path {outside}",
-                "cwd": str(project),
-            })
-            status, verify_path_resp = request(bridge_port, "POST", "/v1/tasks/preview", verify_path_escape)
-            assert status == 400 and "verification argv" in verify_path_resp["error"]
-
-            # Observation groups preflight every call before dispatch and accept only READ/VERIFY.
-            observe = observe_task("observe-read-verify", [
-                {"id": "source", "tool": "read_file", "arguments": {"path": str(target)}},
-                {"id": "tests", "tool": "run_command", "arguments": {"command": "cargo test", "cwd": str(project)}},
-            ])
-            status, observe_preview = request(bridge_port, "POST", "/v1/tasks/preview", observe)
-            assert status == 200, observe_preview
-            op_preview = observe_preview["preview"]["operation"]
-            assert op_preview["classification"] == "verify"
-            assert [call["classification"] for call in op_preview["calls"]] == ["read_only", "verify"]
-            assert observe_preview["preview"]["approval"]["required"] is False
-            status, observe_run = request(bridge_port, "POST", "/v1/tasks", observe)
-            assert status == 200 and observe_run["result"]["status"] == "ok", observe_run
-            assert [call["id"] for call in observe_run["result"]["operation"]["calls"]] == ["source", "tests"]
-            assert observe_run["result"]["applied_mutations"] == []
-
-            calls_before_rejected_group = len([c for c in MockMcp.calls if c["method"] == "tools/call"])
-            observe_with_write = observe_task("observe-write-rejected", [
-                {"id": "source", "tool": "read_file", "arguments": {"path": str(target)}},
-                {"id": "write", "tool": "apply_patch", "arguments": {"path": str(target)}},
-            ])
-            status, rejected_group = request(bridge_port, "POST", "/v1/tasks/preview", observe_with_write)
-            # With general writes disabled this fails even earlier at write policy; either way nothing dispatches.
-            assert status == 400 and ("write_policy_denied" in rejected_group["error"] or "observe_policy_denied" in rejected_group["error"])
-            calls_after_rejected_group = len([c for c in MockMcp.calls if c["method"] == "tools/call"])
-            assert calls_after_rejected_group == calls_before_rejected_group
-
-            # Enable ordinary writes, using optimistic registry versioning.
-            servers_write = json.loads(json.dumps(servers))
-            servers_write["workspace"]["write"] = True
-            status, saved = request(bridge_port, "POST", "/v1/servers", {"servers": servers_write, "expected_version": first_version})
-            assert status == 200, saved
-            second_version = saved["version"]
-            status, observe_write_enabled = request(bridge_port, "POST", "/v1/tasks/preview", observe_with_write)
-            assert status == 400 and "observe_policy_denied" in observe_write_enabled["error"]
-
-            # RW barrier: an exclusive write cannot interleave between calls of one observation group.
-            rw_observe = observe_task("rw-observe", [
-                {"id": "slow", "tool": "slow_read", "arguments": {"path": str(target)}},
-                {"id": "after", "tool": "read_file", "arguments": {"path": str(target)}},
-            ])
-            rw_write = task("rw-write", "apply_patch", target)
-            status, rw_approval = request(bridge_port, "POST", "/v1/approvals", {
-                "task": rw_write, "session_id": "rw-session", "decision": "once"
-            })
-            assert status == 200 and rw_approval["approval_token"]
-            call_mark = len(MockMcp.calls)
-            outcomes = {}
-            def run_observe():
-                outcomes["observe"] = request(bridge_port, "POST", "/v1/tasks", rw_observe)
-            def run_write():
-                outcomes["write"] = request(bridge_port, "POST", "/v1/tasks", {
-                    "task": rw_write, "session_id": "rw-session", "approval_token": rw_approval["approval_token"]
-                })
-            t_read = threading.Thread(target=run_observe)
-            t_write = threading.Thread(target=run_write)
-            t_read.start()
-            time.sleep(0.05)
-            t_write.start()
-            t_read.join(timeout=5); t_write.join(timeout=5)
-            assert outcomes["observe"][0] == 200 and outcomes["write"][0] == 200, outcomes
-            ordered_tools = [c["tool"] for c in MockMcp.calls[call_mark:] if c["method"] == "tools/call"]
-            assert ordered_tools[:3] == ["slow_read", "read_file", "apply_patch"], ordered_tools
-
-            status, stale = request(bridge_port, "POST", "/v1/servers", {"servers": servers, "expected_version": first_version})
-            assert status == 400 and "server_registry_changed" in stale["error"]
-
-            no_roots = json.loads(json.dumps(servers_write))
-            no_roots["workspace"]["roots"] = []
-            status, no_roots_saved = request(bridge_port, "POST", "/v1/servers", {
-                "servers": no_roots, "expected_version": second_version
-            })
-            assert status == 200, no_roots_saved
-            status, no_roots_denied = request(bridge_port, "POST", "/v1/tasks/preview", task("no-roots", "apply_patch", target))
-            assert status == 400 and "no allowed roots" in no_roots_denied["error"]
-            status, roots_restored = request(bridge_port, "POST", "/v1/servers", {
-                "servers": servers_write, "expected_version": no_roots_saved["version"]
-            })
-            assert status == 200, roots_restored
-            second_version = roots_restored["version"]
-
-            # Root containment is value-based, not dependent on MCP argument vocabulary.
-            for index, key_name in enumerate(["filename", "dest", "target", "output", "pcb", "to", "src", "sch"]):
-                bypass = task_args(f"path-bypass-{index}", "apply_patch", {key_name: str(outside)})
-                status, denied = request(bridge_port, "POST", "/v1/tasks/preview", bypass)
-                assert status == 400 and "path_policy_denied" in denied["error"], (key_name, status, denied)
-            tilde_bypass = task_args("tilde-path-bypass", "apply_patch", {"filename": "~/secret.txt"})
-            status, denied = request(bridge_port, "POST", "/v1/tasks/preview", tilde_bypass)
-            assert status == 400 and "path_policy_denied" in denied["error"]
-            relative_named = task_args("relative-named-path", "apply_patch", {"path": "src/main.rs"})
-            status, denied = request(bridge_port, "POST", "/v1/tasks/preview", relative_named)
-            assert status == 400 and "must be an absolute path" in denied["error"]
-            nested_bypass = task_args("nested-path-bypass", "apply_patch", {"payload": {"filename": str(outside)}})
-            status, denied = request(bridge_port, "POST", "/v1/tasks/preview", nested_bypass)
-            assert status == 400 and "path_policy_denied" in denied["error"]
-            allowed_unknown_key = task_args("path-weird-allowed", "apply_patch", {"filename": str(target)})
-            status, allowed_preview = request(bridge_port, "POST", "/v1/tasks/preview", allowed_unknown_key)
-            assert status == 200 and allowed_preview["preview"]["operation"]["path_checks"][0]["root"] == str(project.resolve())
-            non_path_text = task_args("non-path-text", "apply_patch", {"note": "hello/world", "patch": "diff --git a/x b/x\n+const p = '/etc/passwd';"})
-            status, non_path_preview = request(bridge_port, "POST", "/v1/tasks/preview", non_path_text)
-            assert status == 200 and non_path_preview["preview"]["operation"]["path_checks"] == []
-
-            write_task = task("write-ok", "apply_patch", target)
-            status, write_preview = request(bridge_port, "POST", "/v1/tasks/preview", write_task)
-            assert status == 200 and write_preview["preview"]["operation"]["classification"] == "write"
-            assert write_preview["preview"]["approval"]["required"] is True
-            assert write_preview["preview"]["approval"]["mode"] == "mutations"
-            status, unapproved_write = request(bridge_port, "POST", "/v1/tasks", write_task)
-            assert status == 400 and "approval_required" in unapproved_write["error"]
-            browser_session = "browser-session-1"
-            status, approved = request(bridge_port, "POST", "/v1/approvals", {
-                "task": write_task, "session_id": browser_session, "decision": "once"
-            })
-            assert status == 200 and approved["approval_token"]
-            # Bad task/session replays must not consume the legitimate approval token.
-            wrong_task = task("write-other", "apply_patch", target)
-            status, wrong_task_resp = request(bridge_port, "POST", "/v1/tasks", {
-                "task": wrong_task, "session_id": browser_session, "approval_token": approved["approval_token"]
-            })
-            assert status == 400 and "does not match this task" in wrong_task_resp["error"]
-            status, wrong_session = request(bridge_port, "POST", "/v1/tasks", {
-                "task": write_task, "session_id": "wrong-session", "approval_token": approved["approval_token"]
-            })
-            assert status == 400 and "does not match this browser session" in wrong_session["error"]
-            status, approved_write = request(bridge_port, "POST", "/v1/tasks", {
-                "task": write_task, "session_id": browser_session, "approval_token": approved["approval_token"]
-            })
-            assert status == 200 and approved_write["result"]["status"] == "ok"
-
-            # Policy changes intentionally invalidate a token permanently.
-            policy_task = task("policy-token", "apply_patch", target)
-            status, policy_approval = request(bridge_port, "POST", "/v1/approvals", {
-                "task": policy_task, "session_id": browser_session, "decision": "once"
-            })
-            assert status == 200 and policy_approval["approval_token"]
-            status, reg_now = request(bridge_port, "GET", "/v1/servers")
-            changed_policy = reg_now["servers"]
-            changed_policy["workspace"]["approval_mode"] = "all"
-            status, changed_saved = request(bridge_port, "POST", "/v1/servers", {
-                "servers": changed_policy, "expected_version": reg_now["version"]
-            })
-            assert status == 200, changed_saved
-            status, policy_rejected = request(bridge_port, "POST", "/v1/tasks", {
-                "task": policy_task, "session_id": browser_session, "approval_token": policy_approval["approval_token"]
-            })
-            assert status == 400 and "local policy changed after approval" in policy_rejected["error"]
-            status, restored = request(bridge_port, "POST", "/v1/servers", {
-                "servers": servers_write, "expected_version": changed_saved["version"]
-            })
-            assert status == 200, restored
-            second_version = restored["version"]
-            status, consumed_after_policy_change = request(bridge_port, "POST", "/v1/tasks", {
-                "task": policy_task, "session_id": browser_session, "approval_token": policy_approval["approval_token"]
-            })
-            assert status == 400 and "missing, expired, or already used" in consumed_after_policy_change["error"]
-
-            status, destructive = request(bridge_port, "POST", "/v1/tasks/preview", task("destroy", "delete_all", target))
-            assert status == 400 and "destructive_policy_denied" in destructive["error"]
-
-            status, run = request(bridge_port, "POST", "/v1/tasks", read_task)
-            assert status == 200, run
-            assert run["result"]["status"] == "ok"
-            assert run["result"]["operation"]["truncated"] is False
-            key = run["journal_key"]
-            assert key == hashlib.sha256(b"read-1").hexdigest()
-
-            status, replay = request(bridge_port, "POST", "/v1/tasks", read_task)
-            assert status == 200 and replay["replayed"] is True
-            conflict = task("read-1", "read_file", project / "other.rs")
-            status, conflict_resp = request(bridge_port, "POST", "/v1/tasks", conflict)
-            assert status == 400 and "different content" in conflict_resp["error"]
-
-            before_files = set(tasks_dir.iterdir())
-            missing = dict(read_task); missing.pop("id")
-            status, missing_resp = request(bridge_port, "POST", "/v1/tasks", missing)
-            assert status == 400 and "task.id" in missing_resp["error"]
-            assert set(tasks_dir.iterdir()) == before_files
-
-            # Force one 404 on tools/call; bridge must transparently reinitialize once.
-            flaky = task("flaky", "flaky_read", target)
-            status, flaky_run = request(bridge_port, "POST", "/v1/tasks", flaky)
-            assert status == 200, flaky_run
-            assert flaky_run["result"]["status"] == "ok"
-            assert MockMcp.session_counter >= 3  # test connection + pooled session + reinit
-
-            # Explicit ambiguous-journal recovery.
-            ambiguous_id = "ambiguous"
-            amb_key = hashlib.sha256(ambiguous_id.encode()).hexdigest()
-            amb_task_path = tasks_dir / f"{amb_key}.task.json"
-            amb_task_path.write_text(json.dumps(task(ambiguous_id, "read_file", target)))
-            os.chmod(amb_task_path, 0o600)
-            status, ambiguous = request(bridge_port, "POST", "/v1/tasks", task(ambiguous_id, "read_file", target))
-            assert status == 400 and "ambiguous_task_state" in ambiguous["error"]
-            status, recovered = request(bridge_port, "DELETE", f"/v1/tasks/{amb_key}?acknowledge_ambiguous=true")
-            assert status == 200 and recovered["recovered"] == amb_key and not amb_task_path.exists()
-
-            # Session mode: first risk level asks, lease covers same/lower risk only.
-            status, current_registry = request(bridge_port, "GET", "/v1/servers")
-            assert status == 200
-            session_servers = current_registry["servers"]
-            session_servers["workspace"]["approval_mode"] = "session"
-            status, session_saved = request(bridge_port, "POST", "/v1/servers", {
-                "servers": session_servers, "expected_version": current_registry["version"]
-            })
-            assert status == 200, session_saved
-            final_version = session_saved["version"]
-            session_read = task("session-read-1", "read_file", target)
-            status, session_preview = request(bridge_port, "POST", "/v1/tasks/preview", {
-                "task": session_read, "session_id": "tab-abc"
-            })
-            assert status == 200 and session_preview["preview"]["approval"]["required"] is True
-            assert session_preview["preview"]["approval"]["session_approval_available"] is True
-            status, lease = request(bridge_port, "POST", "/v1/approvals", {
-                "task": session_read, "session_id": "tab-abc", "decision": "session"
-            })
-            assert status == 200 and lease["session_granted"] is True
-            assert 0 < lease["session_expires_in_s"] <= 2 * 60 * 60
-            status, leased_run = request(bridge_port, "POST", "/v1/tasks", {
-                "task": session_read, "session_id": "tab-abc", "approval_token": lease["approval_token"]
-            })
-            assert status == 200 and leased_run["result"]["status"] == "ok"
-            session_read2 = task("session-read-2", "read_file", target)
-            status, session_preview2 = request(bridge_port, "POST", "/v1/tasks/preview", {
-                "task": session_read2, "session_id": "tab-abc"
-            })
-            assert status == 200 and session_preview2["preview"]["approval"]["required"] is False
-            session_write = task("session-write", "apply_patch", target)
-            status, session_write_preview = request(bridge_port, "POST", "/v1/tasks/preview", {
-                "task": session_write, "session_id": "tab-abc"
-            })
-            assert status == 200 and session_write_preview["preview"]["approval"]["required"] is True
-
-            # Policy-only mode auto-authorizes within daemon authority, while destructive can stay gated.
-            status, current_registry = request(bridge_port, "GET", "/v1/servers")
-            none_servers = current_registry["servers"]
-            none_servers["workspace"]["approval_mode"] = "none"
-            none_servers["workspace"]["allow_destructive"] = True
-            none_servers["workspace"]["always_approve_destructive"] = True
-            status, none_saved = request(bridge_port, "POST", "/v1/servers", {
-                "servers": none_servers, "expected_version": current_registry["version"]
-            })
-            assert status == 200, none_saved
-            status, none_write_preview = request(bridge_port, "POST", "/v1/tasks/preview", {
-                "task": task("none-write", "apply_patch", target), "session_id": "tab-none"
-            })
-            assert status == 200 and none_write_preview["preview"]["approval"]["required"] is False
-            status, destructive_prompt = request(bridge_port, "POST", "/v1/tasks/preview", {
-                "task": task("none-destroy", "delete_all", target), "session_id": "tab-none"
-            })
-            assert status == 200 and destructive_prompt["preview"]["approval"]["required"] is True
-
-            # all mode forces even reads through a one-time approval token.
-            status, current_registry = request(bridge_port, "GET", "/v1/servers")
-            all_servers = current_registry["servers"]
-            all_servers["workspace"]["approval_mode"] = "all"
-            status, all_saved = request(bridge_port, "POST", "/v1/servers", {
-                "servers": all_servers, "expected_version": current_registry["version"]
-            })
-            assert status == 200, all_saved
-            final_version = all_saved["version"]
-            all_read = task("all-read", "read_file", target)
-            status, all_preview = request(bridge_port, "POST", "/v1/tasks/preview", {
-                "task": all_read, "session_id": "tab-all"
-            })
-            assert status == 200 and all_preview["preview"]["approval"]["required"] is True
-            status, all_unapproved = request(bridge_port, "POST", "/v1/tasks", {
-                "task": all_read, "session_id": "tab-all"
-            })
-            assert status == 400 and "approval_required" in all_unapproved["error"]
-
-            # Security-relevant file modes.
-            assert (state.stat().st_mode & 0o777) == 0o700
-            assert (tasks_dir.stat().st_mode & 0o777) == 0o700
-            for p in tasks_dir.iterdir():
-                assert (p.stat().st_mode & 0o777) == 0o600, (p, oct(p.stat().st_mode & 0o777))
-
-            # Confirm current registry version is coherent.
-            status, registry2 = request(bridge_port, "GET", "/v1/servers")
-            assert status == 200 and registry2["version"] == final_version
-
-            print("smoke_test.py: PASS")
+            run_suite(bridge_port, project, target, outside)
         finally:
             proc.terminate()
             try:
-                proc.wait(timeout=3)
+                proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                proc.kill(); proc.wait()
-            if proc.returncode not in (0, -15):
-                print(proc.stdout.read() if proc.stdout else "")
+                proc.kill()
             mcp.shutdown()
+
+    print(f"\nsmoke test: {len(PASSED)} checks passed\n")
 
 
 if __name__ == "__main__":

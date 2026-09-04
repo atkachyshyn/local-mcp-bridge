@@ -4,7 +4,15 @@ Local MCP Bridge connects a browser-based AI chat to explicitly configured **loc
 
 It is designed for development workflows where the browser model remains the reasoning surface while local tools stay behind local, deny-by-default policy.
 
-> **Status: experimental v0.9.1.** The implementation has regression coverage and security hardening, but v0.9 has not yet completed an independent security review. Do not treat it as a security sandbox. Review the policy model before enabling write, destructive, or VERIFY authority.
+> **Status: experimental v0.9.2.** Orchestration stabilization release. The daemon
+> is authoritative for conversation and task lifecycle; the browser is a serialized
+> event pump. It has regression coverage and security hardening but has not
+> completed an independent security review. **It is not a security sandbox.**
+> Review the policy model before enabling write, destructive, or VERIFY authority.
+>
+> If you cloned this repository before v0.9.2, run `./rotate-token.sh`:
+> `extension/config.js` was previously tracked and its bearer token must be
+> considered disclosed.
 
 ## What problem it solves
 
@@ -28,6 +36,25 @@ Configured local MCP servers
 
 The bridge does **not** provide native same-generation tool execution. Local results return as the next user turn. Auto-continue can submit those turns automatically, but they remain real conversation turns.
 
+## v0.9.2 corrections
+
+v0.9.2 freezes runtime support to LBP 1.3 plus backward-compatible 1.2. The daemon
+owns workflow state, task currentness, checkpoint scope, approval windows,
+execution journals, optional plan state, structured outputs and read-only
+context projection.
+
+- LBP 1.3 adds `mcp.mutate` for ordered bounded mutation batches with conservative
+  `unknown` handling after dispatch.
+- Optional `plan` metadata lets the sidebar render intended future steps as
+  **Progress**. One plan item is one planned step; plan length and checkpoint
+  window size are separate.
+- Optional `outputs` metadata records useful durable products as
+  `pending`, `produced`, `failed` or `unknown`; it is descriptive and never
+  grants authority.
+- The sidebar is organized as connection pill, Progress, Outputs, Context and a
+  compact footer. It renders daemon state rather than reconstructing history from
+  the DOM.
+
 ## v0.9.1 corrections
 
 v0.9.1 keeps LBP 1.2 and the v0.9 execution model, but fixes policy and browser UX issues found during live self-hosting:
@@ -36,12 +63,12 @@ v0.9.1 keeps LBP 1.2 and the v0.9 execution model, but fixes policy and browser 
 - A narrowly matched daemon-owned VERIFY rule may reclassify a generic command tool that its MCP server conservatively marks WRITE **or DESTRUCTIVE**.
 - LBP envelope parsing requires line-isolated markers and is designed for fenced `text` code blocks.
 - Hidden protocol payloads never gate task discovery or execution.
-- Round-trip counting anchors to the latest genuine user prompt and self-heals from actual LBP result turns.
+- Checkpoint progress anchors to the latest genuine user prompt and self-heals from actual LBP result turns.
 - Task status has exactly one selected surface: right-side panel, inline in chat, or off.
 - Raw LBP task/result JSON is hidden by default and is available only as technical/debug information.
 - The right-side panel shows sequential task history/status for the current chain.
 - Approval dialogs show a human summary first; raw arguments are collapsed under **Technical details**.
-- The panel includes **Prime chat**, which inserts a real user-turn bootstrap explaining LBP 1.2. Browser extensions cannot secretly modify ChatGPT's hidden system context, so a real conversation turn is the reliable bootstrap mechanism.
+- The panel includes a real user-turn bootstrap explaining LBP. Browser extensions cannot secretly modify ChatGPT's hidden system context, so a real conversation turn is the reliable bootstrap mechanism.
 
 ## v0.9 execution model
 
@@ -139,7 +166,7 @@ The recommended development default is `mutations`.
 The extension injects a persistent status chip on supported ChatGPT pages. It can show:
 
 ```text
-LBP ● Connected · v0.9.1
+LBP ● Connected · v0.9.2
 LBP ◌ Checking · workspace → observe ×3
 LBP ◌ Running · workspace → run_command
 LBP ⚠ Approval required · workspace → apply_patch
@@ -150,7 +177,7 @@ LBP ✕ Daemon offline
 
 The expanded panel exposes current detail, Manual/Auto mode, chain progress, **Stop chain**, and **Settings**. The chip is browser UX only; it grants no tool authority.
 
-Auto-continue stops or pauses when the extension cannot prove a safe provider state, including a non-empty user draft, provider streaming, task/result mismatch, composer changes, missing Send controls, round-trip limits, or ambiguous mutation results.
+Auto-continue stops or pauses when the extension cannot prove a safe provider state, including a non-empty user draft, provider streaming, task/result mismatch, composer changes, missing Send controls, checkpoint limits, or ambiguous mutation results.
 
 ## Security boundaries
 
@@ -205,7 +232,7 @@ Clone the repository, then run:
 - creates `~/.local-mcp-bridge` with `0700` permissions;
 - creates/reuses a bearer token with `0600` permissions;
 - creates a deny-by-default server registry when none exists;
-- generates the ignored `extension/config.js` containing the local loopback token;
+- generates `extension/config.js` (git-ignored) containing the local loopback token;
 - migrates existing state from `~/.local-mcp-bridge-poc` or the older `~/.atlas-arms-poc` when present.
 
 Then:
@@ -226,15 +253,35 @@ See [`examples/servers.example.json`](examples/servers.example.json).
 
 A development configuration commonly allows read tools for the repository root, optionally allows a command tool with narrow VERIFY rules, enables writes only when needed, uses `approval_mode: "mutations"`, and leaves destructive operations behind explicit approval.
 
-## LBP 1.2 example
+## LBP 1.3 example
 
 ```text
 <LBP_TASK>
 {
   "protocol": "lbp",
-  "version": "1.2",
+  "version": "1.3",
   "id": "inspect-001",
   "title": "Inspect planner and run focused tests",
+  "plan": {
+    "id": "stabilize-v092",
+    "revision": 1,
+    "title": "Stabilize Local MCP Bridge v0.9.2",
+    "items": [
+      {"id": "p1", "phase": "plan", "title": "Inspect planner and run focused tests"}
+    ],
+    "context": {
+      "resources": [{"kind": "workspace", "label": "local-mcp-bridge"}],
+      "constraints": ["LBP 1.3", "LBP 1.2 compatibility"]
+    }
+  },
+  "plan_item_id": "p1",
+  "outputs": [
+    {
+      "id": "planner-report",
+      "label": "Planner verification report",
+      "kind": "report"
+    }
+  ],
   "operation": {
     "type": "mcp.observe",
     "server": "workspace",
@@ -258,7 +305,8 @@ A development configuration commonly allows read tools for the repository root, 
 </LBP_TASK>
 ```
 
-Protocol details: [`protocol/LBP_V1_2.md`](protocol/LBP_V1_2.md).
+Protocol details: [`protocol/LBP_V1_3.md`](protocol/LBP_V1_3.md). LBP 1.2 tasks
+without plan/output metadata remain supported.
 
 ## Validation
 

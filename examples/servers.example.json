@@ -18,10 +18,23 @@
         "argument": "command",
         "cwd_argument": "cwd",
         "argv_prefixes": [
-          ["cargo", "test"],
-          ["cargo", "check"],
-          ["cargo", "clippy"],
-          ["cargo", "fmt", "--check"]
+          [
+            "cargo",
+            "test"
+          ],
+          [
+            "cargo",
+            "check"
+          ],
+          [
+            "cargo",
+            "clippy"
+          ],
+          [
+            "cargo",
+            "fmt",
+            "--check"
+          ]
         ]
       }
     ],
@@ -31,6 +44,10 @@
       "/absolute/path/to/your/repository"
     ],
     "approval_mode": "mutations",
-    "always_approve_destructive": true
+    "always_approve_destructive": true,
+    "approval_escalation": "chain",
+    "freeform_write_tools": [
+      "apply_patch"
+    ]
   }
 }

@@ -34,21 +34,53 @@ class FakeButton {
   constructor() { this.disabled = false; this.attrs = new Map(); this.clicked = 0; }
   getAttribute(name) { return this.attrs.get(name) ?? null; }
   click() { this.clicked += 1; }
+  // The submit control doubles as the voice button when there is nothing to
+  // send; its sprite id is how they are told apart without reading a label.
+  querySelector(selector) {
+    return this.voice && String(selector).includes('voice') ? {} : null;
+  }
 }
 global.HTMLTextAreaElement = FakeTextArea;
 global.HTMLInputElement = FakeInput;
 global.HTMLButtonElement = FakeButton;
 
-function makeBlock(text) {
-  return { tagName: 'PRE', textContent: text, innerText: text, hidden: false };
+function makeBlock(text, nested = []) {
+  // `nested` models ChatGPT's real shape: the markdown <pre> WRAPS a second
+  // CodeMirror <pre> carrying the same text.
+  return {
+    tagName: 'PRE',
+    textContent: text,
+    innerText: text,
+    hidden: false,
+    nested,
+    contains(other) { return other === this || this.nested.includes(other); },
+    querySelector() { return null; }
+  };
 }
 
-function makeHost(role, blocks, id) {
+// A ChatGPT-shaped nest: the outer block and the inner one the DOM would also
+// return from querySelectorAll('pre').
+function makeNestedBlocks(text) {
+  const inner = makeBlock(text);
+  const outer = makeBlock(text, [inner]);
+  return [outer, inner];
+}
+
+function makeHost(role, blocks, id, { proseBefore = '', proseAfter = '' } = {}) {
   const host = {
     role,
     blocks,
+    proseBefore,
+    proseAfter,
     attrs: new Map([['data-message-author-role', role]]),
-    get textContent() { return this.blocks.map((b) => b.textContent).join('\n'); },
+    // The real DOM counts nested nodes' text once, not once per <pre>.
+    get textContent() {
+      const blockText = this.blocks
+        .filter((b) => !this.blocks.some((o) => o !== b && o.contains?.(b)))
+        .map((b) => b.textContent)
+        .join('\n');
+      return [this.proseBefore, blockText, this.proseAfter].filter(Boolean).join('\n');
+    },
     get innerText() { return this.textContent; },
     getAttribute(name) { return this.attrs.get(name) ?? null; },
     closest() { return null; },
@@ -59,15 +91,40 @@ function makeHost(role, blocks, id) {
 }
 
 const send = new FakeButton();
+// ChatGPT localizes every aria-label. `locale` switches the double between an
+// English UI (labels match) and a translated one (they do not), which is the
+// case that stopped the chain in real use.
+let locale = 'en';
+let nativeSubmits = 0;
 const form = {
+  requestSubmit() { nativeSubmits += 1; },
   querySelector(selector) {
-    return selector.includes('send-button') || selector.includes('Send prompt') || selector.includes('Send message')
-      ? send : null;
+    const labelled = selector.includes('send-button') || selector.includes('Send prompt')
+      || selector.includes('Send message') || selector.includes('type="submit"');
+    if (labelled) return locale === 'en' ? send : null;
+    if (selector.includes('composer-submit-button-color')) return send;
+    return null;
   }
 };
-const composer = { innerText: '', textContent: '', closest: (tag) => (tag === 'form' ? form : null) };
+class FakeKeyboardEvent {
+  constructor(type, init = {}) { this.type = type; Object.assign(this, init); }
+}
+global.KeyboardEvent = FakeKeyboardEvent;
+
+const composer = {
+  innerText: '', textContent: '',
+  keys: [],
+  closest: (tag) => (tag === 'form' ? form : null),
+  focus() {},
+  dispatchEvent(event) {
+    if (event instanceof FakeKeyboardEvent) this.keys.push(`${event.type}:${event.key}`);
+    return true;
+  }
+};
 let allMessages = [];
 
+// Minimal capture-phase event plumbing, enough for the pre-send hook.
+const listeners = new Map();
 global.document = {
   querySelector(selector) {
     if (selector === '#prompt-textarea') return composer;
@@ -75,7 +132,30 @@ global.document = {
   },
   querySelectorAll(selector) {
     return selector === '[data-message-author-role]' ? allMessages : [];
+  },
+  addEventListener(type, fn) {
+    if (!listeners.has(type)) listeners.set(type, new Set());
+    listeners.get(type).add(fn);
+  },
+  removeEventListener(type, fn) {
+    listeners.get(type)?.delete(fn);
+  },
+  dispatchEvent(event) {
+    for (const fn of [...(listeners.get(event.type) || [])]) fn(event);
+    return true;
   }
+};
+global.Event = class { constructor(type) { this.type = type; this.target = null; } };
+global.InputEvent = global.Event;
+// Enough contenteditable plumbing for writeComposer's replace-all path.
+global.window = {
+  getSelection: () => ({ removeAllRanges() {}, addRange() {} })
+};
+document.createRange = () => ({ selectNodeContents() {}, collapse() {} });
+document.execCommand = (_cmd, _ui, text) => {
+  composer.innerText = text;
+  composer.textContent = text;
+  return true;
 };
 global.navigator = { clipboard: { writeText: async () => {} } };
 global.location = { hostname: 'chatgpt.com' };
@@ -196,6 +276,12 @@ section('pure-result identification');
 
 const RESULT = { protocol: 'lbp', task_id: 't1', status: 'ok', operation: { classification: 'read_only' } };
 const pureText = LBP.resultEnvelope(RESULT);
+const DELIVERY = {
+  result: RESULT,
+  task_id: RESULT.task_id,
+  delivery_id: 'd-browser-smoke-1',
+  result_digest: 'sha256-browser-smoke'
+};
 
 check('a pure result envelope parses', () => {
   assert.ok(LBP.parsePureResultEnvelope(pureText));
@@ -249,6 +335,50 @@ check('exactly one task in an assistant turn is accepted', () => {
   assert.equal(adapter.assistantTaskState(host).kind, 'one');
 });
 
+check('assistant prose plus one complete task is accepted without modifying prose', () => {
+  const host = makeHost('assistant', [makeBlock(TASK_TEXT)], 'a1-prose', {
+    proseBefore: 'I will inspect the README first.',
+    proseAfter: 'Then I will wait for the bridge result.'
+  });
+  const before = host.textContent;
+  const state = adapter.assistantTaskState(host);
+  assert.equal(state.kind, 'one');
+  assert.equal(state.task.id, 'task-1');
+  assert.equal(host.textContent, before, 'task parsing must not modify assistant prose');
+});
+
+check('assistant prose plus one plaintext task falls back to whole-turn text', () => {
+  const host = makeHost('assistant', [], 'a1-plain', {
+    proseBefore: `I will inspect the README first.\n${TASK_TEXT}\nThen I will wait for the bridge result.`
+  });
+  const state = adapter.assistantTaskState(host);
+  assert.equal(state.kind, 'one');
+  assert.equal(state.task.id, 'task-1');
+});
+
+check('a valid code-block task survives noisy whole-turn semantic text', () => {
+  const host = makeHost('assistant', [makeBlock(TASK_TEXT)], 'a1-noisy');
+  const noisyTurnText = `<LBP_TASK>
+{
+  "protocol"
+:
+  "lbp"
+  "id": "broken"
+}
+</LBP_TASK>`;
+  Object.defineProperty(host, 'innerText', { configurable: true, get: () => noisyTurnText });
+  Object.defineProperty(host, 'textContent', { configurable: true, get: () => noisyTurnText });
+  const state = adapter.assistantTaskState(host);
+  assert.equal(state.kind, 'one', `code-block parse lost to noisy turn text: ${state.kind}`);
+  assert.equal(state.task.id, 'task-1');
+});
+
+check('partial task blocks are ignored until the assistant turn is complete', () => {
+  const partial = 'Normal explanation\n<LBP_TASK>\n{ "protocol": "lbp", "id": "not-ready"';
+  const host = makeHost('assistant', [makeBlock(partial)], 'a-partial');
+  assert.equal(adapter.assistantTaskState(host).kind, 'none');
+});
+
 check('two tasks in SEPARATE code blocks of one turn are rejected', () => {
   // The whole assistant response is one unit. Splitting across code blocks used
   // to yield two independently runnable tasks.
@@ -269,6 +399,24 @@ check('the SAME task rendered twice is one task, not a multi-task reply', () => 
   assert.equal(state.task.id, 'task-1');
 });
 
+check('ChatGPT nests a second <pre> inside the code block; that is ONE payload', () => {
+  // The real ChatGPT DOM is <pre class="overflow-visible"> wrapping
+  // <pre class="cm-content">. Both matched querySelectorAll('pre') with identical
+  // text, so one task looked like two: two disclosure headers in the message,
+  // and blocks.length === 2 -- which made pureResultIn refuse a valid result and
+  // left the chain waiting for a turn that had already arrived.
+  const host = makeHost('assistant', makeNestedBlocks(TASK_TEXT), 'a-nested');
+  assert.equal(adapter.protocolBlocks(host).length, 1, 'the inner <pre> is not a second payload');
+  assert.equal(adapter.assistantTaskState(host).kind, 'one');
+});
+
+check('a nested-<pre> result turn is still recognised as a pure result', () => {
+  const host = makeHost('user', makeNestedBlocks(pureText), 'u-nested');
+  const parsed = adapter.pureResultIn(host);
+  assert.ok(parsed, 'a nested render must not defeat pure-result detection');
+  assert.equal(parsed.task_id, 't1');
+});
+
 check('two DIFFERENT tasks in one reply are still rejected', () => {
   const second = TASK_TEXT.replace('task-1', 'task-2');
   const host = makeHost('assistant', [makeBlock(TASK_TEXT), makeBlock(second)], 'a-two');
@@ -286,28 +434,32 @@ check('a malformed task is reported, never silently skipped', () => {
   assert.equal(adapter.assistantTaskState(host).kind, 'malformed');
 });
 
-check('turn ids prefer the stable provider id', () => {
+check('turn ids prefer the stable provider id', async () => {
   const host = makeHost('assistant', [makeBlock('x')], 'abc-123');
-  const identity = adapter.turnId(host);
-  assert.equal(identity.id, 'msg:abc-123');
+  const identity = await adapter.turnId(host, { conversationId: 'conv-browser-smoke' });
+  assert.equal(identity.id, 'abc-123');
   assert.equal(identity.stable, true);
+  assert.equal(identity.source, 'data-message-id');
 });
 
-check('turn ids fall back to a content hash and say so', () => {
-  const identity = adapter.turnId(makeHost('assistant', [makeBlock('unstable content')]));
-  assert.ok(identity.id.startsWith('text:'));
+check('turn ids fall back to SHA-256 over conversation, role and text', async () => {
+  const identity = await adapter.turnId(makeHost('assistant', [makeBlock('unstable content')]), {
+    conversationId: 'conv-browser-smoke'
+  });
+  assert.ok(identity.id.startsWith('hash:'));
   assert.equal(identity.stable, false);
+  assert.equal(identity.source, 'sha256');
 });
 
-check('latest turns are resolved per role', () => {
+check('provider turns are enumerated per role by provider id', async () => {
   allMessages = [
     makeHost('user', [makeBlock('first')], 'u1'),
     makeHost('assistant', [makeBlock(TASK_TEXT)], 'a1'),
     makeHost('user', [makeBlock('second')], 'u2')
   ];
-  const turns = adapter.latestTurns();
-  assert.equal(turns.user.id, 'msg:u2');
-  assert.equal(turns.assistant.id, 'msg:a1');
+  const turns = await adapter.providerTurns({ conversationId: 'conv-browser-smoke' });
+  assert.deepEqual(turns.user.map((turn) => turn.id), ['u1', 'u2']);
+  assert.deepEqual(turns.assistant.map((turn) => turn.id), ['a1']);
 });
 
 check('a user turn containing extra text is not a bridge result turn', () => {
@@ -337,35 +489,204 @@ check('a composer holding a draft alongside the result does not match', () => {
   assert.equal(adapter.composerMatches(RESULT), false);
 });
 
-check('a click alone is not a submission: acknowledgement requires a new turn', async () => {
+check('one send fires the pre-send hook exactly once', async () => {
+  // Enter fires keydown AND submit; a click fires click AND submit. The hook ran
+  // two or three times per send, so the workflow bootstrap was prepended two or
+  // three times into the same message.
+  let fired = 0;
+  const detach = adapter.onBeforeUserSend(() => { fired += 1; });
+  composer.innerText = 'a genuine human prompt';
+  composer.textContent = composer.innerText;
+
+  const key = new global.Event('keydown', { bubbles: true });
+  key.key = 'Enter';
+  Object.defineProperty(key, 'target', { value: composer });
+  document.dispatchEvent(key);
+  const submit = new global.Event('submit', { bubbles: true });
+  Object.defineProperty(submit, 'target', { value: form });
+  document.dispatchEvent(submit);
+
+  assert.equal(fired, 1, `pre-send hook fired ${fired} times for one send`);
+  detach();
+});
+
+check('a pure result turn never triggers the pre-send hook', () => {
+  let fired = 0;
+  const detach = adapter.onBeforeUserSend(() => { fired += 1; });
   composer.innerText = pureText;
   composer.textContent = pureText;
+  const submit = new global.Event('submit', { bubbles: true });
+  Object.defineProperty(submit, 'target', { value: form });
+  document.dispatchEvent(submit);
+  assert.equal(fired, 0, 'a bridge result turn must not be treated as a human send');
+  detach();
+});
+
+check('a click alone is not a submission: acknowledgement requires a new turn', async () => {
+  composer.innerText = adapter.deliveryText(RESULT, DELIVERY);
+  composer.textContent = composer.innerText;
   allMessages = [makeHost('user', [makeBlock('earlier')], 'u1')];
-  const before = send.clicked;
-  const outcome = await adapter.submitAndAwaitAcknowledgement(RESULT, 400);
-  assert.equal(send.clicked, before + 1);
+  const before = nativeSubmits;
+  const outcome = await adapter.submitAndAwaitAcknowledgement(DELIVERY, 400);
+  assert.equal(nativeSubmits, before + 1);
   assert.equal(outcome.submitted, false);
   assert.equal(outcome.reason, 'no_provider_acknowledgement');
 });
 
-check('acknowledgement succeeds when the exact result appears as a new user turn', async () => {
-  composer.innerText = pureText;
-  composer.textContent = pureText;
+check('acknowledgement succeeds when only the delivery marker appears as a new user turn', async () => {
+  composer.innerText = adapter.deliveryText(RESULT, DELIVERY);
+  composer.textContent = composer.innerText;
   allMessages = [makeHost('user', [makeBlock('earlier')], 'u1')];
-  const pending = adapter.submitAndAwaitAcknowledgement(RESULT, 3000);
-  setTimeout(() => { allMessages = [...allMessages, makeHost('user', [makeBlock(pureText)], 'u-new')]; }, 250);
+  const pending = adapter.submitAndAwaitAcknowledgement(DELIVERY, 3000);
+  setTimeout(() => {
+    allMessages = [...allMessages, makeHost('user', [makeBlock(adapter.deliveryMarker(DELIVERY))], 'u-new')];
+  }, 250);
   const outcome = await pending;
   assert.equal(outcome.submitted, true);
-  assert.equal(outcome.turnId, 'msg:u-new');
+  assert.equal(outcome.turnId, 'u-new');
+  assert.equal(outcome.delivery_id, DELIVERY.delivery_id);
+});
+
+check('a result submitted with the workflow bootstrap is still acknowledged', async () => {
+  // The first round trip carries the bootstrap alongside the result, so the
+  // provider turn is not a PURE result. Requiring purity here left the result
+  // sitting in the composer and the chain stalled.
+  composer.innerText = adapter.deliveryText(RESULT, DELIVERY);
+  composer.textContent = composer.innerText;
+  allMessages = [makeHost('user', [makeBlock('earlier')], 'u1')];
+  const pending = adapter.submitAndAwaitAcknowledgement(DELIVERY, 3000);
+  setTimeout(() => {
+    allMessages = [...allMessages,
+      makeHost('user', [makeBlock('<LBP_WORKFLOW>\nactive\n</LBP_WORKFLOW>'), makeBlock(adapter.deliveryMarker(DELIVERY))], 'u-mixed')];
+  }, 250);
+  const outcome = await pending;
+  assert.equal(outcome.submitted, true, `mixed turn not acknowledged: ${outcome.reason}`);
+  assert.equal(outcome.turnId, 'u-mixed');
+});
+
+check('a draft in the composer is NEVER overwritten', async () => {
+  // The extension destroyed a typed question: writeComposer selects the whole
+  // composer and replaces it, and the guard was optional. The person's message
+  // was replaced by the bridge result and sent, so their question never existed.
+  const draft = 'what does the daemon do when a mutation is ambiguous?';
+  composer.innerText = draft;
+  composer.textContent = draft;
+  const outcome = await adapter.insertResult(RESULT, DELIVERY);
+  assert.equal(outcome.inserted, false, 'the extension overwrote a draft');
+  assert.equal(outcome.reason, 'composer_not_empty');
+  assert.equal(composer.innerText, draft, 'the draft text was modified');
+  assert.equal(outcome.copied, true, 'the result should go to the clipboard instead');
+});
+
+check('an empty composer still accepts the result', async () => {
+  composer.innerText = '';
+  composer.textContent = '';
+  const outcome = await adapter.insertResult(RESULT, DELIVERY);
+  assert.equal(outcome.inserted, true, `refused an empty composer: ${outcome.reason}`);
+  assert.ok(composer.innerText.includes(`delivery=${DELIVERY.delivery_id}`));
+});
+
+check('re-inserting the same result over itself is allowed', async () => {
+  composer.innerText = adapter.deliveryText(RESULT, DELIVERY);
+  composer.textContent = composer.innerText;
+  const outcome = await adapter.insertResult(RESULT, DELIVERY);
+  assert.equal(outcome.inserted, true, 'must be able to replace its own result');
+});
+
+check('a composer the provider touched still auto-submits', async () => {
+  // The result is inserted, then something makes the composer text no longer a
+  // PURE result -- a stray newline, the workflow bootstrap. The strict check
+  // refused to click send, so the result just sat in the box for the user to
+  // submit by hand.
+  const touched = `<LBP_WORKFLOW>\nactive\n</LBP_WORKFLOW>\n\n${adapter.deliveryText(RESULT, DELIVERY)}`;
+  composer.innerText = touched;
+  composer.textContent = touched;
+  assert.equal(adapter.composerMatches(RESULT), false, 'precondition: not a pure result');
+  assert.equal(adapter.composerHoldsDelivery(DELIVERY), true, 'delivery marker must still be found');
+
+  allMessages = [makeHost('user', [makeBlock('earlier')], 'u1')];
+  const beforeClicks = send.clicked;
+  const pending = adapter.submitAndAwaitAcknowledgement(DELIVERY, 2000);
+  setTimeout(() => {
+    allMessages = [...allMessages, makeHost('user', [makeBlock(adapter.deliveryMarker(DELIVERY))], 'u-sent')];
+  }, 200);
+  const outcome = await pending;
+  assert.equal(send.clicked, beforeClicks + 1, 'ChatGPT send button was never clicked');
+  assert.equal(outcome.submitted, true, `not submitted: ${outcome.reason}`);
+});
+
+check('a composer holding a DIFFERENT result is still refused', () => {
+  const other = globalThis.LBP.resultEnvelope({ ...RESULT, task_id: 'someone-else' });
+  composer.innerText = other;
+  composer.textContent = other;
+  assert.equal(adapter.composerHoldsDelivery(DELIVERY), false,
+    'tolerance must not accept the wrong delivery');
+});
+
+check('a localized UI can still be submitted without a human pressing Enter', () => {
+  // Reported: "again I have to press Enter." Every send selector we had was an
+  // English aria-label. On a Ukrainian UI none matched, so findSendButton
+  // returned null, canSubmit() was false, and the chain simply stopped with the
+  // result sitting in the composer.
+  locale = 'uk';
+  composer.innerText = composer.textContent = 'anything';
+  send.voice = false;
+  try {
+    assert.ok(adapter.canSubmit(), 'a translated UI must still be submittable');
+  } finally {
+    locale = 'en';
+    composer.innerText = composer.textContent = '';
+  }
+});
+
+check('an empty composer is never submittable', () => {
+  composer.innerText = composer.textContent = '';
+  assert.equal(adapter.canSubmit(), false);
+});
+
+check('the voice control is never clicked; native form submission is used instead', async () => {
+  // On a localized UI the visible control may currently be the voice button.
+  // The adapter must not click it. requestSubmit remains the first fallback and
+  // acknowledgement stops the strategy chain before synthetic Enter is tried.
+  locale = 'uk';
+  send.voice = true;
+  const result = { protocol: 'lbp', task_id: 'enter-1', status: 'ok', operation: { classification: 'read_only' } };
+  const delivery = { result, task_id: result.task_id, delivery_id: 'd-enter-1', result_digest: 'sha256-enter-1' };
+  const text = adapter.deliveryText(result, delivery);
+  composer.innerText = composer.textContent = text;
+  composer.keys = [];
+  allMessages = [makeHost('user', [makeBlock('earlier')], 'u-before-voice')];
+  const clickedBefore = send.clicked;
+  const submittedBefore = nativeSubmits;
+  const originalRequestSubmit = form.requestSubmit;
+  form.requestSubmit = () => {
+    nativeSubmits += 1;
+    setTimeout(() => {
+      allMessages = [...allMessages, makeHost('user', [makeBlock(adapter.deliveryMarker(delivery))], 'u-voice-sent')];
+      composer.innerText = composer.textContent = '';
+    }, 20);
+  };
+  try {
+    const outcome = await adapter.submitAndAwaitAcknowledgement(delivery, 2000);
+    assert.equal(outcome.submitted, true, `requestSubmit fallback was not acknowledged: ${outcome.reason}`);
+    assert.equal(send.clicked, clickedBefore, 'the voice control must not be clicked');
+    assert.equal(nativeSubmits, submittedBefore + 1, 'native requestSubmit was not used');
+    assert.equal(composer.keys.length, 0, 'synthetic Enter should not be needed after acknowledgement');
+  } finally {
+    form.requestSubmit = originalRequestSubmit;
+    send.voice = false;
+    locale = 'en';
+    composer.innerText = composer.textContent = '';
+  }
 });
 
 check('a DIFFERENT result appearing does not count as acknowledgement', async () => {
-  composer.innerText = pureText;
-  composer.textContent = pureText;
+  composer.innerText = adapter.deliveryText(RESULT, DELIVERY);
+  composer.textContent = composer.innerText;
   allMessages = [makeHost('user', [makeBlock('earlier')], 'u1')];
-  const pending = adapter.submitAndAwaitAcknowledgement(RESULT, 700);
+  const pending = adapter.submitAndAwaitAcknowledgement(DELIVERY, 700);
   setTimeout(() => {
-    const other = LBP.resultEnvelope({ ...RESULT, status: 'error' });
+    const other = adapter.deliveryMarker({ ...DELIVERY, delivery_id: 'd-other-delivery' });
     allMessages = [...allMessages, makeHost('user', [makeBlock(other)], 'u-other')];
   }, 200);
   const outcome = await pending;
@@ -422,23 +743,91 @@ check('connected transport dot is explicitly green', () => {
   assert.ok(/\.lbp-connection-dot\s*\{[^}]*background:\s*var\(--lbp-green\)/.test(style));
 });
 
-check('workflow bootstrap is inserted as a foldable code block', () => {
+check('workflow bootstrap is inserted as a visible code block', () => {
   const coordinator = fs.readFileSync('extension/coordinator.js', 'utf8');
-  assert.ok(coordinator.includes('"```text"'));
+  // A BARE fence, no language tag. A tagged fence leaked the info string into
+  // the block as its first line of content, which broke semantic recognition as
+  // well as looking wrong.
+  assert.ok(coordinator.includes('"```"'));
+  assert.equal(/```text/.test(coordinator), false, 'the language tag leaks into the rendered block');
+  const protocol = fs.readFileSync('extension/protocol.js', 'utf8');
+  assert.equal(/```text/.test(protocol), false, 'the result envelope must use a bare fence');
   assert.ok(coordinator.includes('"<LBP_WORKFLOW>"'));
   assert.ok(coordinator.includes('"```"'));
 });
 
-check('protocol payload disclosure hides the provider code wrapper once', () => {
+check('chat message presentation remains append-only and unmodified', () => {
+  const adapterSource = withoutComments(fs.readFileSync('extension/adapters/chatgpt.js', 'utf8'));
   const presentation = withoutComments(fs.readFileSync('extension/presentation.js', 'utf8'));
-  assert.equal(/wrapper\.insertBefore\(shell,\s*block\)/.test(presentation), false);
-  assert.ok(/container\.parentElement\?\.insertBefore\(shell,\s*container\)/.test(presentation));
-  assert.ok(/container\.classList\.toggle\("lbp-protocol-collapsed",\s*!expanded\)/.test(presentation));
-  // Disclosures are rebuilt every pass rather than reconciled in place, which is
-  // what stopped a provider re-render from leaving two shells for one payload.
-  // The behaviour itself is covered by payload_disclosure_test.js.
-  assert.ok(/for \(const stale of host\.querySelectorAll\("\.lbp-payload-disclosure"\)\) stale\.remove\(\)/
-    .test(presentation), 'stale disclosures must be cleared each pass');
+  const style = fs.readFileSync('extension/style.css', 'utf8');
+
+  for (const source of [adapterSource, presentation, style]) {
+    for (const banned of [
+      'lbp-payload-disclosure',
+      'lbp-protocol-collapsed',
+      'lbp-protocol-container',
+      'payloadMount',
+      'payloadBlocks',
+      'nativeCollapsible',
+      'Show payload',
+      'Hide payload'
+    ]) {
+      assert.equal(source.includes(banned), false, `message mutation token remains: ${banned}`);
+    }
+  }
+  assert.equal(/querySelectorAll\?\.\("p, li, div"\)/.test(adapterSource), false);
+  assert.ok(/function taskSources\(host\)/.test(adapterSource));
+  assert.ok(/renderedNodeText\(block\)/.test(adapterSource),
+    'task detection must prefer exact code-block text');
+  assert.ok(/const wholeTurn\s*=\s*sourceText\(host\)/.test(adapterSource),
+    'task detection must keep whole-turn fallback for non-code-block rendering');
+  assert.equal(/classList\.(?:add|remove|toggle)/.test(presentation), false,
+    'presentation must not add/remove classes on provider messages');
+});
+
+check('result recovery is acknowledged before human-turn reconciliation', () => {
+  const coordinator = withoutComments(fs.readFileSync('extension/coordinator.js', 'utf8'));
+  assert.ok(/reconcileSubmittedResultTurn\(turns\)[\s\S]*reconcileTurns\(turns\)/.test(coordinator),
+    'delivery-marker recovery must run before observe_user_turn');
+  assert.ok(/currentPendingRegistrationFor\(\)/.test(coordinator),
+    'manual-send recovery must resolve daemon current registration');
+  assert.ok(/textContainsDelivery\(api\.sourceText\(turn\.host\),\s*delivery\)/.test(coordinator),
+    'manual-send recovery must verify the visible delivery marker');
+  assert.ok(/acknowledge_submission[\s\S]*turn_id:\s*turn\.id[\s\S]*delivery_id:\s*delivery\.delivery_id/.test(coordinator),
+    'manual-send recovery must acknowledge by provider turn id and delivery id');
+});
+
+check('reload recovery replays stored results without a browser task ledger', () => {
+  const coordinator = withoutComments(fs.readFileSync('extension/coordinator.js', 'utf8'));
+  assert.ok(/function recoverPendingDelivery/.test(coordinator));
+  assert.ok(/"result_ready",\s*"checkpoint"/.test(coordinator),
+    'recovery must be limited to result delivery phases');
+  assert.ok(/fetchStoredDelivery\(pending\.registrationId\)/.test(coordinator),
+    'pending delivery must recover from the daemon journal after reload');
+  assert.ok(/deliveryStatus === "inserted"[\s\S]*composerHoldsDelivery[\s\S]*submitResult/.test(coordinator),
+    'auto retry should submit an inserted pending result without rewriting it');
+});
+
+check('transport lifecycle has concise debug events', () => {
+  const source = fs.readFileSync('extension/coordinator.js', 'utf8')
+    + fs.readFileSync('extension/adapters/chatgpt.js', 'utf8');
+  for (const event of [
+    'assistant_turn_settled',
+    'task_candidate_found',
+    'task_registered',
+    'task_execute_started',
+    'result_ready',
+    'composer_found',
+    'result_inserted',
+    'send_attempt',
+    'send_button_clicked',
+    'result_user_turn_observed',
+    'result_acknowledged',
+    'next_assistant_wait',
+    'delivery_timeout'
+  ]) {
+    assert.ok(source.includes(`"${event}"`), `missing debug event ${event}`);
+  }
 });
 
 check('sidebar uses the exact-reference shell instead of details sections', () => {
@@ -469,7 +858,7 @@ check('sidebar uses the exact-reference shell instead of details sections', () =
   assert.ok(/grid-template-rows:\s*minmax\([\d.]+px,\s*1fr\)\s*auto\s*auto\s*auto/.test(style),
     'panel rows for Outputs/Context/actions must be auto so sections can expand');
 
-  // Five action buttons can be visible; three fixed columns truncated labels.
+  // Four action buttons can be visible; three fixed columns truncated labels.
   assert.ok(/grid-template-columns:\s*repeat\(auto-fit,\s*minmax\([\d.]+px,\s*1fr\)\)/.test(style),
     'action bar must wrap rather than truncate button labels');
 });

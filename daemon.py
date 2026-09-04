@@ -870,20 +870,27 @@ def _act_remove_context_source(state: dict[str, Any], payload: dict[str, Any]) -
 
 
 def _act_enable(state: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    """Ask for the workflow instructions to be attached to the next human turn.
+
+    `enabled` no longer authorises execution -- it only means "send the model the
+    instructions". Execution is gated on an ARMED genuine human send producing a
+    chain, which is what keeps historical and unarmed turns unexecutable:
+    scrolling, rediscovery and another tab still cannot arm one.
+
+    Deliberately non-destructive. This used to clear the active chain, plan and
+    outputs, so pressing Enable mid-run threw the run away.
+    """
     state["enabled"] = True
-    state["baseline_at"] = int(time.time())
-    state["pending_human_send"] = False
-    state["active_chain"] = None
-    state["current_task_id"] = None
-    state["current_registration"] = None
-    state["plan"] = None
-    state["outputs"] = []
-    state["stopped_reason"] = None
-    state["phase"] = "idle"
+    state["workflow_attached"] = False
+    if state.get("baseline_at") is None:
+        state["baseline_at"] = int(time.time())
+    if state.get("phase") == "disabled":
+        state["phase"] = "idle"
     return {}
 
 
 def _act_disable(state: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    """The actual off switch: no instructions, and stop the run."""
     state["enabled"] = False
     state["active_chain"] = None
     state["current_task_id"] = None
@@ -908,9 +915,10 @@ def _act_arm_human_send(state: dict[str, Any], payload: dict[str, Any]) -> dict[
     the turn. Scrolling, virtualization and rediscovery can never arm.
     """
     if not state.get("enabled"):
-        raise ValueError("conversation is not enabled")
+        state["pending_human_send"] = False
+        return {"armed": False, "reason": "disabled"}
     state["pending_human_send"] = True
-    return {}
+    return {"armed": True}
 
 
 def _act_observe_user_turn(state: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
@@ -923,8 +931,9 @@ def _act_observe_user_turn(state: dict[str, Any], payload: dict[str, Any]) -> di
         return {"turn": "known"}
 
     if not state.get("enabled"):
+        state["pending_human_send"] = False
         state["last_user_turn_id"] = turn_id
-        return {"turn": "ignored_disabled"}
+        return {"turn": "disabled"}
 
     if not state.get("pending_human_send"):
         # A user turn we did not arm. Either it is a bridge result turn (handled
@@ -1138,9 +1147,11 @@ def _act_register_task(state: dict[str, Any], payload: dict[str, Any]) -> dict[s
     be refused with no way back.
     """
     if not state.get("enabled"):
-        raise ValueError("conversation is not enabled")
+        raise ValueError("bridge is disabled for this conversation")
     chain = state.get("active_chain")
     if not isinstance(chain, dict):
+        # The chain IS the authorisation: it exists only after THIS tab armed a
+        # genuine human send and the provider then produced that turn.
         raise ValueError("no active chain; a task can only be registered after a genuine human turn")
     if state.get("phase") == "stopped":
         raise ValueError("conversation chain is stopped")
@@ -1212,6 +1223,8 @@ def _act_register_task(state: dict[str, Any], payload: dict[str, Any]) -> dict[s
             "outputs": task.get("outputs", []),
             "execution_status": "registered",
             "delivery_status": "none",
+            "delivery_id": None,
+            "result_digest": None,
             "dispatched_at": None,
             "result": None,
             "created_at": int(time.time()),
@@ -1270,6 +1283,8 @@ def _journal_public(record: dict[str, Any]) -> dict[str, Any]:
         "outputs": record.get("outputs", []),
         "execution_status": record.get("execution_status"),
         "delivery_status": record.get("delivery_status"),
+        "delivery_id": record.get("delivery_id"),
+        "result_digest": record.get("result_digest"),
         # Surfaced so the sidebar can show a completion time on a finished step,
         # as the approved reference does ("Completed - 14:02:11").
         "updated_at": record.get("updated_at"),
@@ -1425,6 +1440,7 @@ def _act_task_execution_status(state: dict[str, Any], payload: dict[str, Any]) -
     with task_lock(record["key"]):
         record = load_journal(record["key"]) or record
         record["execution_status"] = status
+        _ensure_delivery_binding(record)
         record = save_journal(record)
 
     _project_recent_task(state, record)
@@ -1468,6 +1484,7 @@ def _act_task_delivery_status(state: dict[str, Any], payload: dict[str, Any]) ->
         raise ValueError("submitted delivery is recorded only by acknowledge_submission")
     with task_lock(record["key"]):
         record = load_journal(record["key"]) or record
+        _ensure_delivery_binding(record)
         record["delivery_status"] = status
         record = save_journal(record)
     _project_recent_task(state, record)
@@ -1477,10 +1494,10 @@ def _act_task_delivery_status(state: dict[str, Any], payload: dict[str, Any]) ->
 def _act_acknowledge_submission(state: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
     """The provider actually accepted the bridge result as a new user turn.
 
-    Verified against the daemon's own stored canonical result -- matching only
-    task_id is not sufficient. Idempotent on the provider turn id, so a repeated
-    acknowledgement (retry, second tab) cannot advance the checkpoint window
-    twice for one submission.
+    Verified against the daemon's own pending delivery binding. The browser only
+    reports a provider turn id plus the visible delivery marker id; it never has
+    to recover the full result JSON from ChatGPT's rendered DOM, because large
+    pasted content can become a provider attachment.
     """
     record = resolve_registration(payload.get("registration"))
     if record.get("conversation_id") != state["conversation_id"]:
@@ -1491,20 +1508,35 @@ def _act_acknowledge_submission(state: dict[str, Any], payload: dict[str, Any]) 
         raise ValueError("acknowledge_submission requires the provider turn_id")
     turn_id = turn_id.strip()[:256]
 
-    submitted = payload.get("result")
-    stored = record.get("result")
-    if not isinstance(stored, dict):
-        raise ValueError("no stored result for this registration")
-    if canonical_json(submitted) != canonical_json(stored):
-        raise ValueError("submitted result does not match the stored canonical result")
-
-    if record.get("delivery_status") == "submitted" and record.get("submitted_turn_id") == turn_id:
-        return {"acknowledged": "known"}
-
     with task_lock(record["key"]):
         record = load_journal(record["key"]) or record
+        record = _ensure_delivery_binding(record)
+        stored = record.get("result")
+        if not isinstance(stored, dict):
+            raise ValueError("no stored result for this registration")
+
+        delivery_id = payload.get("delivery_id")
+        if not isinstance(delivery_id, str) or not delivery_id.strip():
+            raise ValueError("acknowledge_submission requires delivery_id")
+        delivery_id = delivery_id.strip()[:128]
+        if delivery_id != record.get("delivery_id"):
+            raise ValueError("submitted delivery_id does not match the pending delivery")
+
+        submitted_digest = payload.get("result_digest")
+        if submitted_digest is not None and submitted_digest != record.get("result_digest"):
+            raise ValueError("submitted result_digest does not match the pending delivery")
+
+        submitted = payload.get("result")
+        if submitted is not None and canonical_json(submitted) != canonical_json(stored):
+            raise ValueError("submitted result does not match the stored canonical result")
+
+        if record.get("delivery_status") == "submitted" and record.get("submitted_turn_id") == turn_id:
+            save_journal(record)
+            return {"acknowledged": "known"}
+
         already = record.get("delivery_status") == "submitted"
         record["delivery_status"] = "submitted"
+        record["submitted_delivery_id"] = delivery_id
         record.setdefault("submitted_turn_id", turn_id)
         record = save_journal(record)
 
@@ -2481,6 +2513,27 @@ def task_digest(task: dict[str, Any]) -> str:
     return hashlib.sha256(canonical_json(task).encode("utf-8")).hexdigest()
 
 
+def result_digest(result: dict[str, Any]) -> str:
+    return hashlib.sha256(canonical_json(result).encode("utf-8")).hexdigest()
+
+
+def make_delivery_id() -> str:
+    return f"d-{secrets.token_hex(16)}"
+
+
+def _ensure_delivery_binding(record: dict[str, Any]) -> dict[str, Any]:
+    result = record.get("result")
+    if not isinstance(result, dict):
+        return record
+    digest = result_digest(result)
+    if record.get("result_digest") != digest:
+        record["result_digest"] = digest
+        record["delivery_id"] = make_delivery_id()
+    elif not isinstance(record.get("delivery_id"), str) or not record["delivery_id"].strip():
+        record["delivery_id"] = make_delivery_id()
+    return record
+
+
 def grant_approval(
     raw_task: Any,
     session_id: str | None,
@@ -3252,8 +3305,8 @@ def conversation_execution_context(conversation_id: str, registration_id: Any) -
     with conversation_state_lock(conversation_id):
         state = load_conversation_state(conversation_id)
 
-    if not state.get("enabled"):
-        raise ValueError("stale_task: conversation is not enabled")
+    if state.get("phase") == "disabled":
+        raise ValueError("stale_task: the bridge is switched off for this conversation")
     if state.get("phase") in {"stopped", "disabled"}:
         raise ValueError(f"stale_task: conversation is {state.get('phase')}")
     chain = state.get("active_chain")
@@ -3314,6 +3367,8 @@ def execute_registered_task(
         task, preview = preflight_task(record["task"], session_id, window_id, conversation_id)
 
         if status in {"completed", "error", "unknown"} and isinstance(record.get("result"), dict):
+            record = _ensure_delivery_binding(record)
+            save_journal(record)
             return record["result"], True, key
 
         if status == "executing":
@@ -3323,7 +3378,13 @@ def execute_registered_task(
                 f"Acknowledge with DELETE /v1/tasks/{key}?acknowledge_ambiguous=true"
             )
 
-        if status != "registered":
+        # Both "registered" and "running" mean NOT DISPATCHED -- "running" is only
+        # the browser saying it has started the round trip. Only "executing" means
+        # a call actually went out, and that is the one state we refuse.
+        # Rejecting "running" here bricked every task: the coordinator reported
+        # running, then the daemon refused to execute the task it had just been
+        # told about.
+        if status not in {"registered", "running"}:
             raise ValueError(f"task is not executable from status {status!r}")
 
         authorize_execution(task, preview, session_id, approval_token)
@@ -3343,6 +3404,7 @@ def execute_registered_task(
             else "error"
         )
         record["delivery_status"] = "none"
+        _ensure_delivery_binding(record)
         save_journal(record)
         return result, False, key
 
@@ -3523,7 +3585,15 @@ class Handler(BaseHTTPRequestHandler):
                     body.get("session_id"),
                     body.get("approval_token"),
                 )
-                self._send(200, {"ok": True, "result": result, "replayed": replayed, "journal_key": key})
+                record = load_journal(key) or {}
+                self._send(200, {
+                    "ok": True,
+                    "result": result,
+                    "replayed": replayed,
+                    "journal_key": key,
+                    "delivery_id": record.get("delivery_id"),
+                    "result_digest": record.get("result_digest"),
+                })
                 return
             if self.path == "/v1/servers":
                 body = self._read_json_body()

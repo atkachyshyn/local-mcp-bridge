@@ -54,6 +54,12 @@ context projection.
 - The sidebar is organized as connection pill, Progress, Outputs, Context and a
   compact footer. It renders daemon state rather than reconstructing history from
   the DOM.
+- ChatGPT conversation content is append-only transport: LBP tasks and result
+  delivery markers remain visible exactly as ChatGPT renders them, and the
+  extension does not fold, hide, clone, restyle or otherwise mutate existing
+  chat messages. Large result bodies may become ChatGPT text-file attachments;
+  delivery acknowledgement keys off the visible `delivery=<id>` marker, not the
+  full rendered result JSON.
 
 ## v0.9.1 corrections
 
@@ -65,7 +71,8 @@ v0.9.1 keeps LBP 1.2 and the v0.9 execution model, but fixes policy and browser 
 - Hidden protocol payloads never gate task discovery or execution.
 - Checkpoint progress anchors to the latest genuine user prompt and self-heals from actual LBP result turns.
 - Task status has exactly one selected surface: right-side panel, inline in chat, or off.
-- Raw LBP task/result JSON is hidden by default and is available only as technical/debug information.
+- Earlier payload-hiding UI was a v0.9.1 presentation experiment; v0.9.2 keeps
+  LBP task/result text visible as append-only chat transport.
 - The right-side panel shows sequential task history/status for the current chain.
 - Approval dialogs show a human summary first; raw arguments are collapsed under **Technical details**.
 - The panel includes a real user-turn bootstrap explaining LBP. Browser extensions cannot secretly modify ChatGPT's hidden system context, so a real conversation turn is the reliable bootstrap mechanism.
@@ -177,7 +184,7 @@ LBP ✕ Daemon offline
 
 The expanded panel exposes current detail, Manual/Auto mode, chain progress, **Stop chain**, and **Settings**. The chip is browser UX only; it grants no tool authority.
 
-Auto-continue stops or pauses when the extension cannot prove a safe provider state, including a non-empty user draft, provider streaming, task/result mismatch, composer changes, missing Send controls, checkpoint limits, or ambiguous mutation results.
+Auto-continue stops or pauses when the extension cannot prove a safe provider state, including a non-empty user draft, provider streaming, delivery marker mismatch, composer changes, missing Send controls, checkpoint limits, or ambiguous mutation results.
 
 ## Security boundaries
 
@@ -315,6 +322,7 @@ Run the full local validation set:
 ```bash
 python3 smoke_test.py
 node browser_smoke_test.js
+node transport_invariants_test.js
 python3 -m py_compile daemon.py smoke_test.py
 node --check extension/protocol.js
 node --check extension/adapters/chatgpt.js
@@ -336,8 +344,10 @@ CI runs the same core checks on every push and pull request.
 ├── start.sh
 ├── smoke_test.py
 ├── browser_smoke_test.js
+├── transport_invariants_test.js
 ├── extension/
 ├── protocol/
+│   ├── LBP_V1_3.md
 │   ├── LBP_V1_2.md
 │   └── LBP_V1_1.md
 ├── docs/

@@ -18,12 +18,11 @@ globalThis.LBP_COORDINATOR = (() => {
   const DEFAULT_INTERACTION = Object.freeze({
     mode: "manual",
     max_round_trips: 12,
-    status_surface: "panel",
-    show_protocol_payloads: false
+    status_surface: "panel"
   });
 
   const BOOTSTRAP_TEXT = [
-    "```text",
+    "```",
     "<LBP_WORKFLOW>",
     "Local MCP Bridge is active for this chat.",
     "Emit at most one <LBP_TASK> block per reply. Wait for the <LBP_RESULT> turn before continuing.",
@@ -45,7 +44,15 @@ globalThis.LBP_COORDINATOR = (() => {
   // Per-task UI state that is presentation only. Never used for any execution
   // decision -- those all read daemon state.
   const taskView = new Map();
-  const handledBlocks = new WeakSet();
+  const observedUserTurns = new Set();
+  const settledAssistantTurns = new Set();
+  const handledAssistantTasks = new Set();
+  const deliveringRegistrations = new Set();
+  let pendingHumanTurnBaseline = null;
+
+  function logTransport(event, detail = {}) {
+    try { console.debug("[LBP transport]", event, detail); } catch (_) { /* debug only */ }
+  }
 
   function notify() {
     for (const listener of listeners) {
@@ -72,6 +79,33 @@ globalThis.LBP_COORDINATOR = (() => {
   function setStateStatus(kind, detail = "") {
     stateStatus = { kind, detail };
     notify();
+  }
+
+  function sameTurnId(left, right) {
+    if (!left || !right) return false;
+    if (left === right) return true;
+    return `msg:${left}` === right || left === `msg:${right}`;
+  }
+
+  function turnIdSet(turns, role) {
+    return new Set((turns?.[role] || []).map((turn) => turn.id).filter(Boolean));
+  }
+
+  function deliveryFrom(registration, result, meta = {}) {
+    const taskId = registration?.task_id || result?.task_id || meta.task_id || meta.taskId;
+    const pending = taskId ? currentPendingRegistrationFor({ task_id: taskId }) : null;
+    const view = taskId ? taskView.get(taskId) : null;
+    const deliveryId = meta.delivery_id || meta.deliveryId || pending?.deliveryId || view?.deliveryId;
+    return {
+      result,
+      task_id: taskId,
+      taskId,
+      delivery_id: deliveryId,
+      deliveryId,
+      result_digest: meta.result_digest || meta.resultDigest || pending?.resultDigest || view?.resultDigest || null,
+      resultDigest: meta.result_digest || meta.resultDigest || pending?.resultDigest || view?.resultDigest || null,
+      conversation_id: daemonState?.conversation_id || null
+    };
   }
 
   // --- Serialized daemon access ------------------------------------------------
@@ -173,27 +207,127 @@ globalThis.LBP_COORDINATOR = (() => {
 
   // --- Provider reconciliation --------------------------------------------------
 
+  async function reconcileSubmittedResultTurn(turns) {
+    const api = adapter();
+
+    // Recover the delivery transition even when the automatic send path failed
+    // and the person pressed Enter manually. This must happen BEFORE
+    // observe_user_turn, otherwise a bridge result can be mistaken for a new
+    // human chain and reset checkpoint progress.
+    const pending = currentPendingRegistrationFor();
+    if (!pending?.registrationId || !pending?.deliveryId) return false;
+    const delivery = deliveryFrom(
+      { registration_id: pending.registrationId, task_id: pending.taskId },
+      taskView.get(pending.taskId)?.result || null,
+      pending
+    );
+    for (const turn of turns.user || []) {
+      if (!turn.id || sameTurnId(turn.id, daemonState?.last_user_turn_id)) continue;
+      if (!api.textContainsDelivery(api.sourceText(turn.host), delivery)) continue;
+      try {
+        await stateCall("acknowledge_submission", {
+          registration: pending.registrationId,
+          turn_id: turn.id,
+          delivery_id: delivery.delivery_id,
+          result_digest: delivery.result_digest
+        });
+        setTaskView(pending.taskId, {
+          taskId: pending.taskId,
+          registrationId: pending.registrationId,
+          deliveryId: delivery.delivery_id,
+          resultDigest: delivery.result_digest,
+          delivery: "submitted"
+        });
+        observedUserTurns.add(turn.id);
+        logTransport("result_acknowledged", {
+          task_id: pending.taskId,
+          registration_id: pending.registrationId,
+          turn_id: turn.id,
+          delivery_id: delivery.delivery_id,
+          recovery: "delivery_marker"
+        });
+        return true;
+      } catch (error) {
+        // Keep normal reconciliation fail-closed. A mismatched delivery marker
+        // must never be promoted to delivered just because a new turn exists.
+        setStatus("paused", "LBP ⏸ Result acknowledgement failed", String(error.message || error));
+        return false;
+      }
+    }
+    return false;
+  }
+
+  function currentPendingRegistrationFor(result = null) {
+    const current = daemonState?.current_registration;
+    const tasks = Array.isArray(daemonState?.recent_tasks) ? daemonState.recent_tasks : [];
+    const candidates = tasks
+      .filter((task) => task?.registration_id && task.delivery_status !== "submitted")
+      .filter((task) => ["completed", "error"].includes(task.execution_status));
+    const task = result
+      ? (candidates.find((item) => item.registration_id === current && item.task_id === result.task_id)
+        || candidates.find((item) => item.task_id === result.task_id))
+      : candidates.find((item) => item.registration_id === current);
+    if (!task) return null;
+    return {
+      registrationId: task.registration_id,
+      taskId: task.task_id,
+      executionStatus: task.execution_status,
+      deliveryStatus: task.delivery_status,
+      deliveryId: task.delivery_id || task.deliveryId || null,
+      resultDigest: task.result_digest || task.resultDigest || null
+    };
+  }
+
   async function reconcileTurns(turns) {
-    if (turns.user?.id && turns.user.id !== daemonState?.last_user_turn_id) {
+    const userCandidates = (turns.user || []).filter((turn) =>
+      turn.id
+      && !observedUserTurns.has(turn.id)
+      && !sameTurnId(turn.id, daemonState?.last_user_turn_id)
+    );
+    let observedUser = null;
+    if (daemonState?.pending_human_send && pendingHumanTurnBaseline?.userIds) {
+      observedUser = userCandidates.find((turn) => !pendingHumanTurnBaseline.userIds.has(turn.id));
+    } else {
+      observedUser = userCandidates[0] || null;
+    }
+
+    if (observedUser?.id) {
       // The daemon decides what this turn means. An unarmed turn -- one scrolled
       // into view, produced by another tab, or a bridge result -- can never start
       // a chain, so virtualization cannot resurrect a historical chain.
-      await stateCall("observe_user_turn", { turn_id: turns.user.id });
-    }
-    if (turns.assistant?.id && turns.assistant.id !== daemonState?.last_assistant_turn_id) {
-      await stateCall("observe_assistant_turn", { turn_id: turns.assistant.id });
+      await stateCall("observe_user_turn", { turn_id: observedUser.id });
+      observedUserTurns.add(observedUser.id);
+      if (!daemonState?.pending_human_send) pendingHumanTurnBaseline = null;
     }
   }
 
-  async function handleAssistantTurn(turns) {
-    const api = adapter();
-    if (!turns.assistant) return;
-    if (api.isGenerating()) return;
+  function assistantCandidates(turns) {
+    const assistantIdsAtSend = pendingHumanTurnBaseline?.assistantIds;
+    return (turns.assistant || []).filter((turn) => {
+      if (!turn.id) return false;
+      if (settledAssistantTurns.has(turn.id)) return false;
+      if (assistantIdsAtSend && assistantIdsAtSend.has(turn.id)) return false;
+      return true;
+    });
+  }
 
-    const taskState = api.assistantTaskState(turns.assistant.host);
+  async function handleAssistantTurn(turn) {
+    const api = adapter();
+    if (!turn) return;
+    if (api.isGenerating()) return;
+    if (!settledAssistantTurns.has(turn.id)) {
+      settledAssistantTurns.add(turn.id);
+      logTransport("assistant_turn_settled", { turn_id: turn.id });
+    }
+    if (!sameTurnId(turn.id, daemonState?.last_assistant_turn_id)) {
+      await stateCall("observe_assistant_turn", { turn_id: turn.id });
+    }
+
+    const taskState = api.assistantTaskState(turn.host);
 
     if (taskState.kind === "none") {
       if (daemonState?.phase === "awaiting_assistant") await stateCall("assistant_no_task");
+      pendingHumanTurnBaseline = null;
       return;
     }
     if (taskState.kind === "multiple") {
@@ -208,8 +342,16 @@ globalThis.LBP_COORDINATOR = (() => {
       return;
     }
 
-    if (handledBlocks.has(taskState.block)) return;
-    if (!daemonState?.enabled) return;
+    logTransport("task_candidate_found", {
+      turn_id: turn.id,
+      task_id: taskState.task.id,
+      plan_id: taskState.task.plan_id || taskState.task.plan?.id || null,
+      plan_item_id: taskState.task.plan_item_id || null
+    });
+    const taskKey = `${turn.id}\n${taskState.fingerprint || globalThis.LBP.canonicalJson(taskState.task)}`;
+    if (handledAssistantTasks.has(taskKey)) return;
+    // `enabled` only decides whether the model gets the instructions. What
+    // authorises a run is an active chain, which needs an armed human send.
     if (["stopped", "disabled", "checkpoint"].includes(daemonState?.phase)) return;
 
     let registration;
@@ -217,11 +359,16 @@ globalThis.LBP_COORDINATOR = (() => {
       // Registration is idempotent on (assistant turn, digest), so a reload that
       // rediscovers its own task re-attaches instead of being refused.
       const state = await stateCall("register_task", {
-        assistant_turn_id: turns.assistant.id,
+        assistant_turn_id: turn.id,
         task: taskState.task
       });
       registration = state.task;
-      handledBlocks.add(taskState.block);
+      handledAssistantTasks.add(taskKey);
+      logTransport("task_registered", {
+        task_id: registration.task_id,
+        registration_id: registration.registration_id,
+        status: registration.execution_status
+      });
       setTaskView(taskState.task.id, {
         taskId: taskState.task.id,
         title: taskState.task.title || taskState.task.id,
@@ -237,13 +384,21 @@ globalThis.LBP_COORDINATOR = (() => {
       }
       // A refusal here is the daemon rejecting stale or out-of-phase work. That
       // is the barrier doing its job, not something to work around.
-      handledBlocks.add(taskState.block);
+      handledAssistantTasks.add(taskKey);
       setStatus("paused", "LBP ⏸ Task not registered", message);
       return;
     }
 
     if (registration.execution_status === "registered") {
       await runTask(registration);
+    }
+  }
+
+  async function handleAssistantTurns(turns) {
+    for (const turn of assistantCandidates(turns)) {
+      if (["stopped", "disabled", "checkpoint"].includes(daemonState?.phase)) return;
+      await handleAssistantTurn(turn);
+      if (daemonState?.phase !== "awaiting_assistant" && daemonState?.phase !== "task_registered") return;
     }
   }
 
@@ -283,15 +438,19 @@ globalThis.LBP_COORDINATOR = (() => {
         token = approval.approval_token || null;
       }
 
+      // Local spinner only. Execution status belongs to the daemon, which moves
+      // the journal registered -> executing -> terminal itself; reporting
+      // "running" here first is what made the daemon refuse the dispatch.
       setTaskView(taskId, { status: "running" });
-      await stateCall("task_execution_status", { registration: registrationId, status: "running" });
       setStatus("running", "LBP ◌ Running locally…", taskId, true);
+      logTransport("task_execute_started", { task_id: taskId, registration_id: registrationId });
 
       const response = await chrome.runtime.sendMessage({
         type: "lbp-run", registration: registrationId, approvalToken: token
       });
       if (!response?.ok) throw new Error(response?.error || "local task failed");
       const result = response.payload.result;
+      const delivery = deliveryFrom(registration, result, response.payload);
 
       // Execution status and delivery status are separate facts. This records
       // only what the local operation did; whether the result ever reached the
@@ -299,9 +458,17 @@ globalThis.LBP_COORDINATOR = (() => {
       const executionStatus = result.status === "ok" ? "completed"
         : result.status === "unknown" ? "unknown" : "error";
       await stateCall("task_execution_status", { registration: registrationId, status: executionStatus });
-      setTaskView(taskId, { status: executionStatus, result });
+      const pending = currentPendingRegistrationFor({ task_id: taskId });
+      const boundDelivery = deliveryFrom(registration, result, pending || delivery);
+      setTaskView(taskId, {
+        status: executionStatus,
+        result,
+        deliveryId: boundDelivery.delivery_id,
+        resultDigest: boundDelivery.result_digest
+      });
+      logTransport("result_ready", { task_id: taskId, registration_id: registrationId, status: result.status });
 
-      await deliverResult(registration, result);
+      await deliverResult(registration, result, boundDelivery);
     } catch (error) {
       setTaskView(taskId, { status: "error", detail: String(error.message || error) });
       setStatus("error", "LBP ⚠ Task failed", String(error.message || error));
@@ -313,60 +480,141 @@ globalThis.LBP_COORDINATOR = (() => {
 
   // --- Result delivery -----------------------------------------------------------
 
-  async function deliverResult(registration, result) {
+  async function deliverResult(registration, result, deliveryMeta = {}) {
     const api = adapter();
     const taskId = registration.task_id;
-    const auto = daemonState?.mode === "auto_continue" && daemonState?.phase !== "stopped";
+    const registrationId = registration.registration_id;
+    const delivery = deliveryFrom(registration, result, deliveryMeta);
+    if (deliveringRegistrations.has(registrationId)) return;
+    deliveringRegistrations.add(registrationId);
+    try {
+      const auto = daemonState?.mode === "auto_continue" && daemonState?.phase !== "stopped";
 
-    const insertion = await api.insertResult(result, { requireEmpty: auto });
-    if (!insertion.inserted) {
-      await stateCall("task_delivery_status", {
-        registration: registration.registration_id,
-        status: insertion.reason === "composer_not_empty" ? "withheld" : "failed"
-      });
-      setTaskView(taskId, { delivery: insertion.reason });
-      setStatus("paused", "LBP ⏸ Result not delivered",
-        `${taskId} completed locally; the result is on the clipboard. Use Re-deliver result.`);
-      return;
-    }
-    await stateCall("task_delivery_status", { registration: registration.registration_id, status: "inserted" });
+      const insertion = await api.insertResult(result, delivery);
+      if (!insertion.inserted) {
+        await stateCall("task_delivery_status", {
+          registration: registrationId,
+          status: insertion.reason === "composer_not_empty" ? "withheld" : "failed"
+        });
+        setTaskView(taskId, { delivery: insertion.reason });
+        logTransport("delivery_timeout", { task_id: taskId, registration_id: registrationId, reason: insertion.reason });
+        setStatus("paused", "LBP ⏸ Result not delivered",
+          `${taskId} completed locally; the result is on the clipboard. Use Re-deliver result.`);
+        return;
+      }
+      await stateCall("task_delivery_status", { registration: registrationId, status: "inserted" });
 
-    // A checkpoint result is inserted and left for the human. It is never
-    // auto-submitted, and the window does not advance until it is.
-    if (daemonState?.phase === "checkpoint") {
-      setTaskView(taskId, { delivery: "awaiting_checkpoint" });
-      setStatus("paused", "LBP ⏸ Checkpoint",
-        `Result for ${taskId} is in the composer. Continue to open a new approval window.`);
-      return;
+      // A checkpoint result is inserted and left for the human. It is never
+      // auto-submitted, and the window does not advance until it is.
+      if (daemonState?.phase === "checkpoint") {
+        setTaskView(taskId, { delivery: "awaiting_checkpoint" });
+        setStatus("paused", "LBP ⏸ Checkpoint",
+          `Result for ${taskId} is in the composer. Continue to open a new approval window.`);
+        return;
+      }
+      if (!auto) {
+        setStatus("connected", "LBP ● Result ready", `${taskId} · submit when ready.`);
+        return;
+      }
+      await submitResult(registration, result, delivery);
+    } finally {
+      deliveringRegistrations.delete(registrationId);
     }
-    if (!auto) {
-      setStatus("connected", "LBP ● Result ready", `${taskId} · submit when ready.`);
-      return;
-    }
-    await submitResult(registration, result);
   }
 
-  async function submitResult(registration, result) {
+  async function submitResult(registration, result, deliveryMeta = {}) {
     const api = adapter();
     const taskId = registration.task_id;
+    const delivery = deliveryFrom(registration, result, deliveryMeta);
     if (!(await api.waitUntilIdle(10000))) {
       setStatus("paused", "LBP ⏸ Provider not ready", `Result for ${taskId} remains in the composer.`);
       return;
     }
-    const submitted = await api.submitAndAwaitAcknowledgement(result);
+    const submitted = await api.submitAndAwaitAcknowledgement(delivery);
     if (!submitted.submitted) {
+      logTransport("delivery_timeout", {
+        task_id: taskId,
+        registration_id: registration.registration_id,
+        reason: submitted.reason
+      });
       setStatus("paused", "LBP ⏸ Result not submitted", `${taskId}: ${submitted.reason}`);
       return;
     }
-    // Only now, with a real provider turn carrying the exact stored result, is
+    // Only now, with a real provider turn carrying the expected delivery marker, is
     // delivery recorded and the checkpoint window allowed to advance.
     await stateCall("acknowledge_submission", {
       registration: registration.registration_id,
       turn_id: submitted.turnId,
-      result: submitted.result
+      delivery_id: delivery.delivery_id,
+      result_digest: delivery.result_digest
     });
-    setTaskView(taskId, { delivery: "submitted" });
+    logTransport("result_acknowledged", {
+      task_id: taskId,
+      registration_id: registration.registration_id,
+      turn_id: submitted.turnId,
+      delivery_id: delivery.delivery_id
+    });
+    setTaskView(taskId, {
+      delivery: "submitted",
+      deliveryId: delivery.delivery_id,
+      resultDigest: delivery.result_digest
+    });
     setStatus("continuing", "LBP ● Continuing", `${taskId} submitted as the next user turn.`);
+    logTransport("next_assistant_wait", { task_id: taskId });
+  }
+
+  async function fetchStoredDelivery(registrationId) {
+    const response = await chrome.runtime.sendMessage({
+      type: "lbp-run", registration: registrationId, approvalToken: null
+    });
+    if (!response?.ok) throw new Error(response?.error || "stored result replay failed");
+    return {
+      result: response.payload.result,
+      delivery_id: response.payload.delivery_id || null,
+      result_digest: response.payload.result_digest || null
+    };
+  }
+
+  async function recoverPendingDelivery() {
+    if (!["result_ready", "checkpoint"].includes(daemonState?.phase)) return;
+    const pending = currentPendingRegistrationFor();
+    if (!pending || deliveringRegistrations.has(pending.registrationId)) return;
+
+    const api = adapter();
+    let result = taskView.get(pending.taskId)?.result || null;
+    let deliveryMeta = pending;
+    if (!result) {
+      const replay = await fetchStoredDelivery(pending.registrationId);
+      result = replay.result;
+      deliveryMeta = replay;
+      setTaskView(pending.taskId, {
+        taskId: pending.taskId,
+        registrationId: pending.registrationId,
+        status: pending.executionStatus,
+        result,
+        deliveryId: replay.delivery_id,
+        resultDigest: replay.result_digest
+      });
+      logTransport("result_ready", {
+        task_id: pending.taskId,
+        registration_id: pending.registrationId,
+        status: result.status,
+        recovery: "journal_replay"
+      });
+    }
+
+    const registration = {
+      registration_id: pending.registrationId,
+      task_id: pending.taskId
+    };
+    const delivery = deliveryFrom(registration, result, deliveryMeta);
+    if (pending.deliveryStatus === "inserted" && api.composerHoldsDelivery(delivery)) {
+      if (daemonState?.mode === "auto_continue" && daemonState?.phase !== "checkpoint") {
+        await submitResult(registration, result, delivery);
+      }
+      return;
+    }
+    await deliverResult(registration, result, delivery);
   }
 
   // --- Public actions -------------------------------------------------------------
@@ -385,18 +633,33 @@ globalThis.LBP_COORDINATOR = (() => {
 
   async function continueCheckpoint() {
     const api = adapter();
-    const entry = [...taskView.values()].reverse().find((item) => item.result);
+    let entry = [...taskView.values()].reverse().find((item) => item.result);
+    if (!entry) {
+      const pending = currentPendingRegistrationFor();
+      if (!pending) return;
+      const replay = await fetchStoredDelivery(pending.registrationId);
+      const result = replay.result;
+      entry = {
+        taskId: pending.taskId,
+        registrationId: pending.registrationId,
+        result,
+        deliveryId: replay.delivery_id || pending.deliveryId,
+        resultDigest: replay.result_digest || pending.resultDigest
+      };
+      setTaskView(pending.taskId, entry);
+    }
     if (!entry) return;
     await stateCall("request_continue");
-    if (!api.composerMatches(entry.result)) {
-      const insertion = await api.insertResult(entry.result, { requireEmpty: false });
+    const delivery = deliveryFrom({ registration_id: entry.registrationId, task_id: entry.taskId }, entry.result, entry);
+    if (!api.composerHoldsDelivery(delivery)) {
+      const insertion = await api.insertResult(entry.result, delivery);
       if (!insertion.inserted) {
         setStatus("error", "LBP ⚠ Composer changed", "Re-deliver the result before continuing.");
         return;
       }
     }
     const registration = { registration_id: entry.registrationId, task_id: entry.taskId };
-    await submitResult(registration, entry.result);
+    await submitResult(registration, entry.result, delivery);
   }
 
   async function updateInteraction(next) {
@@ -443,9 +706,22 @@ globalThis.LBP_COORDINATOR = (() => {
   // it never re-enters MCP. Re-running work requires a newly authored task with a
   // new id, which is why there is no "Run again".
   async function redeliverResult(taskId) {
-    const entry = taskView.get(taskId);
-    if (!entry?.result) return;
-    const insertion = await adapter().insertResult(entry.result, { requireEmpty: false });
+    let entry = taskView.get(taskId);
+    if (!entry?.result) {
+      const pending = currentPendingRegistrationFor({ task_id: taskId });
+      if (!pending) return;
+      const replay = await fetchStoredDelivery(pending.registrationId);
+      entry = {
+        taskId: pending.taskId,
+        registrationId: pending.registrationId,
+        result: replay.result,
+        deliveryId: replay.delivery_id || pending.deliveryId,
+        resultDigest: replay.result_digest || pending.resultDigest
+      };
+      setTaskView(pending.taskId, entry);
+    }
+    const delivery = deliveryFrom({ registration_id: entry.registrationId, task_id: entry.taskId }, entry.result, entry);
+    const insertion = await adapter().insertResult(entry.result, delivery);
     await stateCall("task_delivery_status", {
       registration: entry.registrationId,
       status: insertion.inserted ? "inserted" : "failed"
@@ -461,11 +737,13 @@ globalThis.LBP_COORDINATOR = (() => {
 
   async function scanOnce() {
     const api = adapter();
-    const turns = api.latestTurns();
     await refreshState();
     if (!daemonState) return;
+    const turns = await api.providerTurns({ conversationId: daemonState.conversation_id });
+    await reconcileSubmittedResultTurn(turns);
     await reconcileTurns(turns);
-    if (daemonState.enabled) await handleAssistantTurn(turns);
+    await recoverPendingDelivery();
+    await handleAssistantTurns(turns);
   }
 
   async function scan() {
@@ -489,22 +767,39 @@ globalThis.LBP_COORDINATOR = (() => {
   function start() {
     const api = adapter();
 
-    api.onBeforeUserSend(() => {
-      if (!daemonState?.enabled) return;
-      if (!daemonState?.workflow_attached) {
+    api.onBeforeUserSend((event) => {
+      // Disabled really means off. Never arm a chain while the conversation is
+      // disabled; otherwise a normal ChatGPT send can create an executable chain
+      // even though the sidebar still shows Enable.
+      if (daemonState?.enabled !== true) return;
+      const pending = currentPendingRegistrationFor();
+      if (pending?.deliveryId && api.textContainsDelivery(event?.text || "", pending)) return;
+
+      // Attaching the bootstrap is a one-time courtesy, not a gate. Mark it
+      // attached FIRST: the state round trip is async, and a second send that
+      // lands before it resolves used to prepend the instructions again.
+      if (daemonState?.enabled && !daemonState?.workflow_attached) {
+        daemonState = { ...daemonState, workflow_attached: true };
         const attached = api.prependComposerText(BOOTSTRAP_TEXT);
         if (attached?.prepended) void stateCall("workflow_attached", { attached: true });
       }
       // Arms the daemon only. The chain is created when the provider actually
       // produces the turn, so a send that never happens changes nothing.
-      void stateCall("arm_human_send").catch(() => {});
+      void (async () => {
+        const turns = await api.providerTurns({ conversationId: daemonState?.conversation_id || "" });
+        pendingHumanTurnBaseline = {
+          userIds: turnIdSet(turns, "user"),
+          assistantIds: turnIdSet(turns, "assistant")
+        };
+        await stateCall("arm_human_send");
+      })().catch(() => {});
     });
 
     const observer = new MutationObserver((mutations) => {
       const relevant = mutations.some((mutation) => {
         const node = mutation.target?.nodeType === Node.ELEMENT_NODE
           ? mutation.target : mutation.target?.parentElement;
-        return !node?.closest?.(".lbp-global-status, .lbp-wrap, .lbp-modal-overlay, .lbp-payload-disclosure");
+        return !node?.closest?.(".lbp-global-status, .lbp-modal-overlay");
       });
       if (relevant) void scan();
     });

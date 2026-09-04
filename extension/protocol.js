@@ -349,8 +349,16 @@ globalThis.LBP = (() => {
     return String(text || "").split(marker).length - 1;
   }
 
+  // A bare fence, deliberately with no language tag.
+  //
+  // With a language tag on the fence, ChatGPT rendered the submitted turn as a
+  // code block whose FIRST LINE was that tag -- the info string leaked into the
+  // content.
+  // That is not cosmetic: the rendered turn then no longer reads as exactly one
+  // envelope and nothing else, so parsePureResultEnvelope refused it and the
+  // turn stopped being recognisable as a pure result.
   function resultEnvelope(result) {
-    return `\`\`\`text\n<LBP_RESULT>\n${JSON.stringify(result, null, 2)}\n</LBP_RESULT>\n\`\`\``;
+    return `\`\`\`\n<LBP_RESULT>\n${JSON.stringify(result, null, 2)}\n</LBP_RESULT>\n\`\`\``;
   }
 
   return Object.freeze({

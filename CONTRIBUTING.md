@@ -9,6 +9,7 @@ Run:
 ```bash
 python3 smoke_test.py
 node browser_smoke_test.js
+node transport_invariants_test.js
 python3 -m py_compile daemon.py smoke_test.py
 node --check extension/protocol.js
 node --check extension/adapters/chatgpt.js

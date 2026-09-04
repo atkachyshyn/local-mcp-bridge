@@ -46,7 +46,7 @@ const REFERENCE = {
   autoLabel: 'Auto-continue',
   sections: ['Outputs', 'Context'],
   contextChip: 'local-mcp-bridge',
-  actions: ['Hide protocol', 'Stop chain', 'Settings']
+  actions: ['Stop chain', 'Settings']
 };
 
 // --- Daemon state reproducing the reference scenario -------------------------------
@@ -113,7 +113,7 @@ global.chrome = {
   runtime: { sendMessage: async () => ({ ok: true, payload: {} }), id: 'test' }
 };
 
-const INTERACTION = { mode: 'auto_continue', max_round_trips: 12, status_surface: 'panel', show_protocol_payloads: true };
+const INTERACTION = { mode: 'auto_continue', max_round_trips: 12, status_surface: 'panel' };
 const taskViews = new Map([
   ['t1', { status: 'completed' }],
   ['t2', { status: 'completed' }],
@@ -218,6 +218,8 @@ check('context chip shows the connected workspace', () => {
 check('action bar wording', () => {
   const labels = all('.lbp-action-label').map((n) => n.textContent.trim());
   for (const want of REFERENCE.actions) assert.ok(labels.includes(want), `missing action "${want}" in ${JSON.stringify(labels)}`);
+  assert.equal(labels.includes('Hide protocol'), false, 'Hide protocol must not be present');
+  assert.equal(labels.includes('Show protocol'), false, 'Show protocol must not be present');
 });
 
 check('the mode label and switch follow the configured mode, not the enabled flag', () => {
@@ -227,11 +229,12 @@ check('the mode label and switch follow the configured mode, not the enabled fla
   // painted straight back over.
   const original = { enabled: STATE.enabled, mode: STATE.mode };
   try {
+    // `enabled` only means the model was given the instructions, so it must not
+    // change the reported mode at all.
     STATE.enabled = false;
     STATE.mode = 'auto_continue';
     globalThis.LBP_PRESENTATION.render();
-    assert.equal(txt('.lbp-meta-status'), 'Disabled');
-    assert.equal(txt('.lbp-meta-mode'), 'Auto', 'mode must report auto_continue even while disabled');
+    assert.equal(txt('.lbp-meta-mode'), 'Auto', 'mode must report auto_continue regardless of enabled');
     assert.equal(root.querySelector('.lbp-switch-input').checked, true);
 
     STATE.mode = 'manual';

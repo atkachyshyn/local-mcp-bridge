@@ -250,9 +250,11 @@ was skipped, the **task** status is `unknown` even when the individual failure
 was an ordinary error. Whole-batch retry after a partial application is unsafe,
 and the task status is what the assistant reads.
 
-## Result envelope
+## Result delivery
 
 ````
+LBP result · task=task-004 · delivery=d-7fa291
+
 <LBP_RESULT>
 {
   "protocol": "lbp",
@@ -268,13 +270,20 @@ and the task status is what the assistant reads.
 
 `status` is one of `ok`, `error`, `unknown`.
 
-A result turn submitted by the bridge must be a **pure** result: exactly one
-envelope, optionally inside a single fenced block, with no other text in the
-message. A user message that merely contains a result envelope alongside other
-text is a genuine human turn and starts a new chain.
+The first line is transport metadata. It must remain ordinary visible message
+text and must not be hidden, folded or manipulated.
 
-The daemon verifies a submitted result against its own stored canonical result
-for that task. Matching only `task_id` is not sufficient.
+The full `<LBP_RESULT>` follows the marker. Providers may convert a sufficiently
+large submitted body into a generated text-file attachment, so acknowledgement
+must not require the complete result JSON to be recoverable from rendered DOM.
+
+Before Send, the browser snapshots visible user `data-message-id` values. After
+Send, delivery is acknowledged only when a new user `data-message-id` appears and
+that message's visible semantic text contains the expected `delivery=<id>`.
+
+The daemon binds `conversation_id`, `task_id`, `delivery_id` and `result_digest`
+when it stores the result. Matching only `task_id` or merely seeing any new user
+message is not sufficient.
 
 ### Execution status vs delivery status
 

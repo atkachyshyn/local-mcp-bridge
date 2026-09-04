@@ -11,14 +11,14 @@
     <header>
       <div class="kicker">LOCAL MCP BRIDGE</div>
       <h1>MCP servers & policy</h1>
-      <p>The daemon owns local authority. Browser settings below control continuation and presentation only.</p>
+      <p>The daemon owns local authority. Browser settings below control continuation and policy.</p>
     </header>
 
     <div id="daemon" class="daemon">Checking local bridge…</div>
 
     <section class="interaction-card">
       <div class="policy-title interaction-title">Browser-chat interaction</div>
-      <p class="interaction-help">Choose one execution-history surface. Technical LBP payloads stay collapsed by default and never gate execution.</p>
+      <p class="interaction-help">Choose result continuation and the local checkpoint interval.</p>
       <div class="policy-grid">
         <label class="wide"><span>Result continuation</span>
           <select id="interaction-mode">
@@ -27,16 +27,8 @@
           </select>
         </label>
         <label><span>Checkpoint interval</span><div class="with-suffix"><input id="interaction-max-rounds" type="number" min="1" max="50" value="12"><span>steps</span></div><small>At each checkpoint the bridge pauses locally before posting the next result. Continue to the next checkpoint or stop the chain.</small></label>
-        <label><span>Execution history display</span>
-          <select id="interaction-status-surface">
-            <option value="panel">Right-side panel</option>
-            <option value="inline">Inline in chat</option>
-            <option value="off">Off</option>
-          </select>
-        </label>
-        <label class="toggle wide"><input id="interaction-show-protocol" type="checkbox"> Expand technical LBP payloads by default</label>
       </div>
-      <p class="interaction-note">Recommended: Auto-continue + Right-side panel + technical payloads collapsed. The checkpoint is a human continuation gate, not a hard chain limit. Daemon policy still decides tools, roots, VERIFY, writes, destructive operations, and approvals.</p>
+      <p class="interaction-note">Recommended: Auto-continue + right-side Progress sidebar. LBP task and result blocks remain visible in chat exactly as ChatGPT renders them. Daemon policy still decides tools, roots, VERIFY, writes, destructive operations, and approvals.</p>
     </section>
 
     <section id="servers"></section>

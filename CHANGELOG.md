@@ -1,5 +1,37 @@
 # Changelog
 
+### Fixed (unreleased)
+
+- **Chat messages are append-only transport again.** Removed the browser-side LBP
+  payload disclosure/folding path, the sidebar Hide/Show protocol control, and
+  the CSS that collapsed provider code blocks. The extension now reads settled
+  messages for protocol envelopes but does not insert UI into, restyle, hide,
+  clone or rewrite existing ChatGPT message DOM.
+- **Task detection now parses the settled assistant turn, not presentation
+  nodes.** Assistant prose may appear before or after a fenced/plain LBP task
+  block, partial blocks are ignored, malformed/multiple tasks are rejected, and
+  duplicate scans are idempotent through daemon registration.
+- **Result delivery only acknowledges observed provider turns.** Auto-send uses
+  the visible Send button first, falls back to provider form submission/Enter
+  only while the expected result is still in the composer, and advances daemon
+  state only after a new user turn semantically equals the stored LBP result.
+- **Pending result recovery survives reload and manual Send.** If a completed
+  result is still pending delivery, the coordinator replays the stored daemon
+  journal result instead of re-executing the MCP task. A manually submitted exact
+  LBP result is acknowledged before human-turn reconciliation, so it does not
+  start a new chain or reset plan/checkpoint state.
+- **The chain stopped at every send on a non-English UI.** Every send-button
+  selector was an English `aria-label`. ChatGPT localizes them, so on a
+  Ukrainian UI `findSendButton` returned null, `canSubmit()` was false, and the
+  result sat in the composer until a human pressed Enter. Detection now falls
+  back to the untranslated submit class (rejecting the voice control by its
+  sprite id, since the two share it), and then to dispatching Enter in the
+  composer — which needs no button at all.
+- **The fence's language tag leaked into the message.** `` ```text `` rendered
+  as a code block whose first line of content was the word `text`, so the turn
+  no longer read as exactly one envelope and `parsePureResultEnvelope` refused
+  it. Both the result envelope and the workflow bootstrap now use a bare fence.
+
 ## 0.9.2 — 2026-09-03
 
 Orchestration stabilization. No new capability: the MCP transport, policy and
@@ -54,6 +86,17 @@ stale/replay eligibility and approval-window identity.
   unsafe.
 - Pre-dispatch failures remain ordinary `error`, and READ/VERIFY failures remain
   `error`, so the common path is unaffected.
+
+### Enable is instructions, not authority
+
+- `enable` now only asks for the workflow instructions to be attached to the
+  next human turn. It no longer authorises execution and no longer clears the
+  active chain, plan and outputs -- pressing it mid-run used to throw the run
+  away.
+- Execution is authorised by an **armed genuine human send** producing a chain.
+  Scrolling, provider re-renders, task rediscovery and other tabs cannot arm
+  one, so historical turns still cannot execute.
+- `disable` is the off switch: it stops the run and blocks execution.
 
 ### Orchestration
 

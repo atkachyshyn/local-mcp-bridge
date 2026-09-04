@@ -6,14 +6,12 @@
 // is wrong in exactly the situation where the user most needs it to be right.
 globalThis.LBP_PRESENTATION = (() => {
   const coordinator = () => globalThis.LBP_COORDINATOR;
-  const adapter = () => globalThis.LBP_PROVIDER_ADAPTER;
 
   let ui = null;
   let activeDialog = null;
   let activeContextMenu = null;
   let outputsExpanded = false;
   let contextExpanded = false;
-  const payloadExpanded = new Map();
 
   function el(tag, className, text) {
     const node = document.createElement(tag);
@@ -34,7 +32,6 @@ globalThis.LBP_PRESENTATION = (() => {
     bookmark: '<path d="M4.5 2.5h7v11l-3.5-2.3-3.5 2.3v-11Z"/>',
     plus: '<path d="M8 4.5v7M4.5 8h7"/>',
     folder: '<path d="M2.5 5.2V12a1 1 0 0 0 1 1h9a1 1 0 0 0 1-1V6.4a1 1 0 0 0-1-1H8.3L7 4.1a1 1 0 0 0-.7-.3H3.5a1 1 0 0 0-1 1Z"/>',
-    protocol: '<path d="M1.8 8S4.2 4 8 4s6.2 4 6.2 4-2.4 4-6.2 4-6.2-4-6.2-4Z"/><circle cx="8" cy="8" r="1.9"/><path d="M2.5 13.5 13.5 2.5"/>',
     enable: '<circle cx="8" cy="8" r="5.6"/><path d="M5.7 8.1 7.3 9.7l3-3.4"/>',
     checkpoint: '<path d="M3 8h10M9 4l4 4-4 4"/>',
     stop: '<rect x="4.2" y="4.2" width="7.6" height="7.6" rx="1.4"/>',
@@ -168,7 +165,6 @@ globalThis.LBP_PRESENTATION = (() => {
       return button;
     }
 
-    const protocol = actionButton("Show protocol", "protocol");
     const enable = actionButton("Enable", "enable");
     const checkpoint = actionButton("Continue to next checkpoint", "checkpoint");
     const stop = actionButton("Stop chain", "stop");
@@ -176,27 +172,9 @@ globalThis.LBP_PRESENTATION = (() => {
 
     enable.addEventListener("click", () => void coordinator().enable());
     checkpoint.addEventListener("click", () => void coordinator().continueCheckpoint());
-    protocol.addEventListener("click", async () => {
-      const next = { ...coordinator().interaction() };
-      next.show_protocol_payloads = !next.show_protocol_payloads;
-      coordinator().setInteraction(next);
-      // "Show protocol" is now an explicit expand-all / collapse-all over the
-      // payloads currently on screen, because folding is decided per payload and
-      // no longer read from this flag on every pass.
-      payloadExpanded.clear();
-      if (next.show_protocol_payloads) {
-        for (const key of visiblePayloadKeys()) payloadExpanded.set(key, true);
-      }
-      try {
-        const stored = await chrome.storage.local.get("interaction");
-        await chrome.storage.local.set({ interaction: { ...(stored?.interaction || {}), ...next } });
-      } catch (_) { /* presentation preference only */ }
-      applyPayloadVisibility();
-      render();
-    });
     stop.addEventListener("click", () => void coordinator().stop());
     settings.addEventListener("click", () => chrome.runtime.sendMessage({ type: "lbp-open-options" }));
-    actions.append(protocol, enable, checkpoint, stop, settings);
+    actions.append(enable, checkpoint, stop, settings);
     panel.append(progress, outputs, context, actions);
     root.append(pill, panel);
 
@@ -243,7 +221,7 @@ globalThis.LBP_PRESENTATION = (() => {
       metaMode, metaCount, checkpointAt, timeline, list, outputs, outputsSummary,
       outputsCount, outputsList, context, contextChips, contextMenu,
       contextAdd, contextNotice, contextDetails, footerMeta, autoToggle,
-      autoToggleInput, actions, enable, checkpoint, protocol, stop, settings
+      autoToggleInput, actions, enable, checkpoint, stop, settings
     };
     return ui;
   }
@@ -303,11 +281,14 @@ globalThis.LBP_PRESENTATION = (() => {
     // A running chain stays "Active" as the reference specifies; the step row
     // already says "In progress". Only the states the reference does not depict
     // -- stopped and checkpoint -- get their own label.
-    const status = !enabled ? "Disabled"
+    // `enabled` only means "the model was given the instructions", so it is no
+    // longer a status. What matters is whether a run is live.
+    const status = phase === "disabled" ? "Off"
       : phase === "stopped" ? "Stopped"
       : phase === "checkpoint" ? "Checkpoint"
       : state.active_chain ? "Active"
-      : "Enabled";
+      : "Idle";
+    void enabled;
     // The configured mode, NOT whether the chat is enabled. Forcing "Manual"
     // while disabled made the sidebar contradict the settings page, and made the
     // Auto-continue switch look broken: a click set the mode, then this line
@@ -426,7 +407,7 @@ globalThis.LBP_PRESENTATION = (() => {
         stopped_by_user: "Run stopped. Send a new message to start a fresh one."
       }[state.stopped_reason] || "Run stopped. Send a new message to start a fresh one.";
       surface.list.append(el("div", "lbp-timeline-empty",
-        !state.enabled ? "Enable Local MCP for this chat to start a run."
+        state.phase === "disabled" ? "The bridge is off for this chat. Enable to switch it back on."
           : state.phase === "stopped" ? stoppedReason
           : state.active_chain ? "Waiting for the assistant's first task…"
           : "Send a message to start a run."));
@@ -662,7 +643,6 @@ globalThis.LBP_PRESENTATION = (() => {
     const stateStatus = coordinator().stateStatus?.() || { kind: state ? "ready" : "loading" };
     const status = coordinator().status();
     const identity = coordinator().identity();
-    const interaction = coordinator().interaction();
 
     const connected = Boolean(identity.bridgeVersion);
     const transportKind = connected ? "connected" : status.kind === "checking" ? "checking" : "offline";
@@ -673,7 +653,6 @@ globalThis.LBP_PRESENTATION = (() => {
     if (identity.lbpVersion) pillBits.push(`LBP ${identity.lbpVersion}`);
     surface.main.textContent = pillBits.join(" · ");
     surface.dot.className = `lbp-connection-dot lbp-connection-dot-${transportKind}`;
-    surface.protocol.__lbpLabel.textContent = interaction.show_protocol_payloads ? "Hide protocol" : "Show protocol";
 
     const unavailable = !state && (stateStatus.kind === "unavailable" || status.kind === "error");
     if (!state) {
@@ -793,116 +772,5 @@ globalThis.LBP_PRESENTATION = (() => {
     return activeDialog;
   }
 
-  // --- Protocol payload disclosure ----------------------------------------------------
-
-  function summarize(text) {
-    const tasks = globalThis.LBP.extractTasks(text).filter((task) => !task.__parse_error);
-    if (tasks.length === 1) {
-      return { kind: "task", title: tasks[0].title || tasks[0].id, meta: operationLabel(tasks[0].operation) };
-    }
-    const result = globalThis.LBP.parsePureResultEnvelope(text)
-      || globalThis.LBP.extractResults(text).filter((item) => !item.__parse_error)[0];
-    if (result) {
-      return {
-        kind: "result",
-        title: result.status === "ok" ? "Local MCP result" : `Local MCP result · ${result.status}`,
-        meta: result.task_id || ""
-      };
-    }
-    if (text.includes("<LBP_WORKFLOW>")) {
-      return { kind: "workflow", title: "Local MCP workflow attached", meta: "" };
-    }
-    return null;
-  }
-
-  function protocolContainer(host, block) {
-    let current = block.parentElement;
-    let best = current;
-    const blockText = apiText(block);
-    while (current?.parentElement && current.parentElement !== host) {
-      const parent = current.parentElement;
-      const preCount = parent.querySelectorAll?.("pre")?.length || 0;
-      if (preCount !== 1) break;
-      const extra = apiText(parent).replace(blockText, "").trim();
-      if (extra.length > 180) break;
-      if (parent.children && parent.children.length > 4) break;
-      best = parent;
-      current = parent;
-    }
-    return best || block.parentElement;
-  }
-
-  function apiText(node) {
-    return adapter().sourceText(node);
-  }
-
-  // The disclosure sits immediately before the provider's code container. The
-  // raw container stays in the DOM and is hidden by class, which avoids duplicate
-  // summaries while still letting the user unfold the actual payload.
-  function visiblePayloadKeys() {
-    const api = adapter();
-    const keys = [];
-    for (const host of api.messageHosts()) {
-      for (const block of api.protocolBlocks(host)) {
-        const summary = summarize(api.sourceText(block));
-        if (summary) keys.push(`${summary.kind}:${summary.title}:${summary.meta}`);
-      }
-    }
-    return keys;
-  }
-
-  function applyPayloadVisibility() {
-    const api = adapter();
-    const generating = typeof api.isGenerating === "function" ? api.isGenerating() : false;
-    for (const host of api.messageHosts()) {
-      // Rebuilt every pass. Reusing them meant that when the provider re-rendered
-      // a message the old shell stayed put and a second one was inserted next to
-      // the new container, so one task showed up as two.
-      for (const stale of host.querySelectorAll(".lbp-payload-disclosure")) stale.remove();
-      const blocks = api.protocolBlocks(host);
-      const streamingHost = generating && host === api.latestTurns?.().assistant?.host;
-      for (const block of blocks) {
-        const text = api.sourceText(block);
-        const summary = summarize(text);
-        if (!summary) continue;
-
-        const wrapper = block.parentElement;
-        const container = protocolContainer(host, block);
-        if (!wrapper || !container) continue;
-        const key = `${summary.kind}:${summary.title}:${summary.meta}`;
-
-        // Folded once the provider has finished typing. While a reply is still
-        // streaming its payload stays open so you can watch it arrive; after
-        // that only an explicit expand keeps it open.
-        const expanded = payloadExpanded.has(key) ? payloadExpanded.get(key) === true : streamingHost;
-
-        const shell = el("div", "lbp-payload-disclosure");
-        const body = el("div", "lbp-payload-disclosure-body");
-        body.append(el("div", "lbp-payload-disclosure-title"), el("div", "lbp-payload-disclosure-meta"));
-        const toggle = el("button", "lbp-payload-toggle");
-        toggle.type = "button";
-        toggle.addEventListener("click", () => {
-          payloadExpanded.set(key, !expanded);
-          applyPayloadVisibility();
-        });
-        shell.append(body, toggle);
-        container.parentElement?.insertBefore(shell, container);
-        shell.dataset.lbpPayloadKind = summary.kind;
-        shell.dataset.lbpAuthor = host.getAttribute("data-message-author-role") || "";
-        shell.classList.toggle("lbp-payload-task", summary.kind === "task");
-        shell.classList.toggle("lbp-payload-result", summary.kind === "result");
-        shell.classList.toggle("lbp-payload-workflow", summary.kind === "workflow");
-        shell.querySelector(".lbp-payload-disclosure-title").textContent = summary.title;
-        shell.querySelector(".lbp-payload-disclosure-meta").textContent = summary.meta;
-
-        container.classList.add("lbp-protocol-container");
-        container.classList.toggle("lbp-protocol-collapsed", !expanded);
-        block.hidden = false;
-        shell.querySelector(".lbp-payload-toggle").textContent =
-          expanded ? "Hide" : (summary.kind === "workflow" ? "Show instructions" : "Show payload");
-      }
-    }
-  }
-
-  return Object.freeze({ render, ensureUi, requestApproval, applyPayloadVisibility });
+  return Object.freeze({ render, ensureUi, requestApproval });
 })();

@@ -7,8 +7,7 @@ let registryVersion = null;
 const DEFAULT_INTERACTION = Object.freeze({
   mode: "manual",
   max_round_trips: 12,
-  status_surface: "panel",
-  show_protocol_payloads: false
+  status_surface: "panel"
 });
 
 function interactionConfig() {
@@ -20,16 +19,10 @@ function interactionConfig() {
     throw new Error("Checkpoint interval must be an integer from 1 to 50 steps.");
   }
 
-  const status_surface = document.querySelector("#interaction-status-surface").value;
-  if (!["panel", "inline", "off"].includes(status_surface)) {
-    throw new Error("Invalid task status display.");
-  }
-
   return {
     mode,
     max_round_trips: max,
-    status_surface,
-    show_protocol_payloads: document.querySelector("#interaction-show-protocol").checked
+    status_surface: "panel"
   };
 }
 
@@ -43,11 +36,7 @@ async function loadInteraction() {
   document.querySelector("#interaction-max-rounds").value =
     Number.isInteger(max) && max >= 1 && max <= 50 ? max : 12;
 
-  document.querySelector("#interaction-status-surface").value =
-    ["panel", "inline", "off"].includes(raw.status_surface) ? raw.status_surface : "panel";
-
-  document.querySelector("#interaction-show-protocol").checked =
-    raw.show_protocol_payloads === true || raw.collapse_payloads === false;
+  void raw.status_surface;
 }
 
 function bridgeMessage(message) {

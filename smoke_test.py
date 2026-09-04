@@ -235,7 +235,7 @@ def second_plan_task(task_id, plan_item_id, target, include_plan=False):
     return value
 
 
-def run_suite(port, project, target, outside):
+def run_suite(port, project, target, outside, state_dir):
     def section(name):
         print(f"\n{name}")
 
@@ -282,7 +282,62 @@ def run_suite(port, project, target, outside):
 
     other = Conversation(port, conv_id("other-chat"))
     assert other.state["enabled"] is False
-    ok("enabling one conversation leaves every other conversation disabled")
+    assert other.state["active_chain"] is None
+    ok("enabling one conversation leaves every other conversation untouched")
+
+    # Disabled is a real off switch. An un-enabled conversation cannot arm a
+    # chain, and therefore cannot register or execute local work.
+    bare = Conversation(port, conv_id("never-enabled"))
+    bare.act("observe_user_turn", turn_id="scrolled-in")
+    status, body = bare.try_act("register_task", assistant_turn_id="b-a1", task=task("bare", "read_file", target))
+    assert status == 400 and "disabled" in body["error"], body
+    ok("a disabled conversation cannot register a task")
+
+    armed = bare.act("arm_human_send")
+    assert armed.get("armed") is False
+    bare.act("observe_user_turn", turn_id="bare-u1")
+    assert bare.state["active_chain"] is None
+    ok("a disabled conversation cannot arm or create an executable chain")
+
+    bare.act("enable")
+    bare.act("arm_human_send")
+    bare.act("observe_user_turn", turn_id="bare-u2")
+    reg_bare, (status, run_bare) = bare.run_approved(task("bare-1", "read_file", target), "b-a2")
+    assert status == 200 and run_bare["result"]["status"] == "ok", run_bare
+    assert run_bare["delivery_id"].startswith("d-") and len(run_bare["result_digest"]) == 64, run_bare
+    assert bare.state["enabled"] is True
+    ok("Enable is required before an armed chain can execute, and execution returns a delivery binding")
+
+    result_turn = Conversation(port, conv_id("bridge-result-turn")).begin()
+    reg_result, (status, run_result) = result_turn.run_approved(
+        task("bridge-result-1", "read_file", target), "br-a1"
+    )
+    assert status == 200, run_result
+    chain_id = result_turn.state["active_chain"]["chain_id"]
+    result_turn.act("task_execution_status", registration=reg_result, status="completed")
+    result_turn.act("task_delivery_status", registration=reg_result, status="inserted")
+    result_turn.acknowledge(reg_result, "br-u-result")
+    assert result_turn.state["phase"] == "awaiting_assistant"
+    result_turn.act("observe_user_turn", turn_id="br-u-result")
+    assert result_turn.state["active_chain"]["chain_id"] == chain_id
+    assert result_turn.state["active_chain"]["total_task_count"] == 1
+    ok("an acknowledged bridge result turn does not start a new human chain")
+
+    # Enable must not throw away a run in progress.
+    live = Conversation(port, conv_id("enable-midrun")).begin()
+    reg_live = live.register(task("live-1", "read_file", target), "l-a1")["registration_id"]
+    chain_before = live.state["active_chain"]["chain_id"]
+    live.act("enable")
+    assert live.state["active_chain"]["chain_id"] == chain_before, "Enable discarded the running chain"
+    assert live.state["current_registration"] == reg_live
+    ok("pressing Enable mid-run does not discard the chain")
+
+    # Disable is the real off switch.
+    live.act("disable")
+    assert live.state["phase"] == "disabled"
+    status, body = live.run(reg_live)
+    assert status == 400 and "switched off" in body["error"], body
+    ok("Disable stops the run and blocks execution")
 
     p = Conversation(port, prov_id("tab-A")).begin(turn="pu1")
     p_reg = p.register(task("prov-task", "read_file", target), "pa1")
@@ -359,6 +414,34 @@ def run_suite(port, project, target, outside):
     assert same["registration_id"] == reg_a
     ok("re-registering the same task id and digest re-attaches to the same handle")
 
+    # Replay the coordinator's REAL call order. The suite used to skip straight
+    # from register to run, so it never caught that reporting "running" before
+    # dispatch made the daemon refuse to execute -- every task in the browser
+    # died with "task is not executable from status 'running'" while the tests
+    # stayed green.
+    seq = Conversation(port, conv_id("coordinator-order")).begin()
+    reg_seq = seq.register(task("seq-1", "read_file", target), "seq-a1")["registration_id"]
+    status, preview = seq.preview(reg_seq)
+    assert status == 200, preview
+    seq.act("task_execution_status", registration=reg_seq, status="running")
+    status, run_seq = seq.run(reg_seq)
+    assert status == 200 and run_seq["result"]["status"] == "ok", run_seq
+    ok("a task still executes after the browser has reported it as running")
+
+    # Only a dispatched task is unsafe to run again.
+    with_dispatch = Conversation(port, conv_id("dispatched-guard")).begin()
+    reg_d = with_dispatch.register(task("dispatch-1", "read_file", target), "d-a1")["registration_id"]
+    key = hashlib.sha256(
+        with_dispatch.id.encode() + b"\x00" + b"dispatch-1"
+    ).hexdigest()
+    journal = pathlib.Path(str(state_dir / "tasks" / f"{key}.journal.json"))
+    record = json.loads(journal.read_text())
+    record["execution_status"] = "executing"
+    journal.write_text(json.dumps(record))
+    status, body = with_dispatch.run(reg_d)
+    assert status == 400 and "ambiguous_task_state" in body["error"], body
+    ok("a task that actually dispatched is still refused as ambiguous")
+
     conflicting = task("task1", "read_file", outside)
     status, body = a.try_act("register_task", assistant_turn_id="a1", task=conflicting)
     assert status == 400 and "different content" in body["error"], body
@@ -400,7 +483,7 @@ def run_suite(port, project, target, outside):
     ok("conversation Context sources are daemon-owned, root-validated and removable without changing MCP policy")
 
     plan_conv.act("task_delivery_status", registration=reg_p1, status="inserted")
-    plan_conv.act("acknowledge_submission", registration=reg_p1, turn_id="plan-ack1", result=run_p1["result"])
+    plan_conv.acknowledge(reg_p1, "plan-ack1")
     reg_p2 = plan_conv.register(planned_task("plan-task-2", "p2", target), "plan-a2")
     assert reg_p2["plan_item_id"] == "p2"
     assert plan_conv.state["plan"]["items"][1]["status"] == "current"
@@ -435,7 +518,7 @@ def run_suite(port, project, target, outside):
     assert status == 200, run_s1
     second.act("task_execution_status", registration=reg_s1, status="completed")
     second.act("task_delivery_status", registration=reg_s1, status="inserted")
-    second.act("acknowledge_submission", registration=reg_s1, turn_id="second-ack1", result=run_s1["result"])
+    second.acknowledge(reg_s1, "second-ack1")
 
     second.act("arm_human_send")
     second.act("observe_user_turn", turn_id="second-u2")
@@ -452,7 +535,7 @@ def run_suite(port, project, target, outside):
     assert status == 200, run_t1
     stale_plan.act("task_execution_status", registration=reg_t1, status="completed")
     stale_plan.act("task_delivery_status", registration=reg_t1, status="inserted")
-    stale_plan.act("acknowledge_submission", registration=reg_t1, turn_id="stale-ack1", result=run_t1["result"])
+    stale_plan.acknowledge(reg_t1, "stale-ack1")
     stale_plan.act("arm_human_send")
     stale_plan.act("observe_user_turn", turn_id="stale-u2")
     status, body = stale_plan.try_act(
@@ -470,7 +553,7 @@ def run_suite(port, project, target, outside):
     assert status == 200, run_c1
     same_chain.act("task_execution_status", registration=reg_c1, status="completed")
     same_chain.act("task_delivery_status", registration=reg_c1, status="inserted")
-    same_chain.act("acknowledge_submission", registration=reg_c1, turn_id="same-ack1", result=run_c1["result"])
+    same_chain.acknowledge(reg_c1, "same-ack1")
     status, body = same_chain.try_act(
         "register_task", assistant_turn_id="same-a2",
         task=second_plan_task("same-2", "q1", target, include_plan=True),
@@ -530,7 +613,7 @@ def run_suite(port, project, target, outside):
         k.act("task_execution_status", registration=reg, status="completed")
         if index == 1:
             k.act("task_delivery_status", registration=reg, status="inserted")
-            k.act("acknowledge_submission", registration=reg, turn_id=f"ack{index}", result=run["result"])
+            k.acknowledge(reg, f"ack{index}")
     assert k.state["phase"] == "checkpoint", k.state["phase"]
     assert k.state["active_chain"]["window"] == 0
     ok("the window fills and the chain reaches a checkpoint, never a deadlock")
@@ -546,19 +629,22 @@ def run_suite(port, project, target, outside):
 
     reg2, result2 = results[1]
     k.act("task_delivery_status", registration=reg2, status="inserted")
-    k.act("acknowledge_submission", registration=reg2, turn_id="ack2", result=result2)
+    k.acknowledge(reg2, "ack2")
     assert k.state["active_chain"]["window"] == 1
     assert k.state["active_chain"]["window_task_count"] == 0
     ok("the window advances only on acknowledged provider submission")
 
-    status, body = k.try_act("acknowledge_submission", registration=reg2, turn_id="ack2", result=result2)
+    status, body = k.try_acknowledge(reg2, "ack2")
     assert status == 200 and k.state["active_chain"]["window"] == 1
     ok("a repeated acknowledgement cannot advance the window twice")
 
-    status, body = k.try_act("acknowledge_submission", registration=reg2, turn_id="ack-forged",
-                             result={"protocol": "lbp", "task_id": "cp-2", "status": "ok", "operation": {}})
-    assert status == 400 and "does not match the stored canonical result" in body["error"], body
-    ok("a forged result cannot be acknowledged even with the right task id")
+    status, body = k.try_act("acknowledge_submission", registration=reg2, turn_id="ack-missing-delivery")
+    assert status == 400 and "requires delivery_id" in body["error"], body
+    ok("a provider turn cannot be acknowledged without a delivery id")
+
+    status, body = k.try_acknowledge(reg2, "ack-forged", delivery_id="d-forged")
+    assert status == 400 and "delivery_id does not match" in body["error"], body
+    ok("a forged delivery marker cannot be acknowledged even with the right task id")
 
     # -------------------------------------------------------- wedge resistance
     section("wedge resistance")
@@ -623,7 +709,7 @@ def run_suite(port, project, target, outside):
     ch.act("task_execution_status", registration=reg_c1, status="completed")
     ch.act("task_delivery_status", registration=reg_c1, status="inserted")
     ch.act("request_continue")
-    ch.act("acknowledge_submission", registration=reg_c1, turn_id="cack1", result=run_c1["result"])
+    ch.acknowledge(reg_c1, "cack1")
     assert ch.state["active_chain"]["window"] == 1
     reg_c2 = ch.register(task("cs-2", "apply_patch", target), "a2")["registration_id"]
     status, preview2 = ch.preview(reg_c2)
@@ -864,11 +950,28 @@ class Conversation:
             token = approval["approval_token"]
         return reg, self.run(reg, token)
 
+    def delivery_for(self, registration):
+        for item in reversed(self.state.get("recent_tasks", [])):
+            if item.get("registration_id") == registration:
+                delivery_id = item.get("delivery_id")
+                result_digest = item.get("result_digest")
+                assert delivery_id and result_digest, item
+                return {"delivery_id": delivery_id, "result_digest": result_digest}
+        raise AssertionError(f"missing delivery metadata for {registration}")
+
+    def acknowledge(self, registration, turn_id, **extra):
+        payload = {**self.delivery_for(registration), **extra}
+        return self.act("acknowledge_submission", registration=registration, turn_id=turn_id, **payload)
+
+    def try_acknowledge(self, registration, turn_id, **extra):
+        payload = {**self.delivery_for(registration), **extra}
+        return self.try_act("acknowledge_submission", registration=registration, turn_id=turn_id, **payload)
+
     def deliver(self, reg, result, turn_id):
         self.act("task_execution_status", registration=reg,
                  status={"ok": "completed", "unknown": "unknown"}.get(result["status"], "error"))
         self.act("task_delivery_status", registration=reg, status="inserted")
-        return self.try_act("acknowledge_submission", registration=reg, turn_id=turn_id, result=result)
+        return self.try_acknowledge(reg, turn_id)
 
 
 def mutate_task(task_id, calls):
@@ -930,7 +1033,7 @@ def main():
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         try:
             wait_health(bridge_port)
-            run_suite(bridge_port, project, target, outside)
+            run_suite(bridge_port, project, target, outside, state)
         finally:
             proc.terminate()
             try:

@@ -247,9 +247,9 @@ def run_suite(port, project, target, outside, state_dir):
     section("protocol freeze")
 
     status, health = request(port, "GET", "/health")
-    assert status == 200 and health["protocols"][0]["versions"] == ["1.3", "1.2"], health
+    assert status == 200 and health["protocols"][0]["versions"] == ["1.3.1", "1.3", "1.2"], health
     assert set(health["operations"]) == {"mcp.call", "mcp.list_tools", "mcp.observe", "mcp.mutate"}
-    ok("daemon advertises exactly LBP 1.3 and 1.2")
+    ok("daemon advertises LBP 1.3.1, 1.3 and 1.2")
 
     c = Conversation(port, conv_id("proto")).begin()
     legacy = task("legacy-11", "read_file", target)
@@ -263,6 +263,52 @@ def run_suite(port, project, target, outside, state_dir):
     reg = c.register(single, "a-single")
     assert reg["task_id"] == "legacy-single"
     ok("single-element operations[] normalizes as canonical 1.2")
+
+    v131_task = task("v131-plan", "read_file", target)
+    v131_task["version"] = "1.3.1"
+    v131_task["plan"] = {
+        "id": "v131-plan",
+        "revision": 1,
+        "title": "LBP 1.3.1 plan",
+        "items": [{"id": "step-1", "title": "Read source"}],
+        "context": {"resources": [], "constraints": []},
+    }
+    v131_task["plan_id"] = "v131-plan"
+    v131_task["plan_revision"] = 1
+    v131_task["plan_item_id"] = "step-1"
+    v131_task["outputs"] = [
+        {"id": "out-1", "label": "Source read", "kind": "evidence"}
+    ]
+    v131 = Conversation(port, conv_id("v131-task")).begin()
+    reg_v131, (status, run_v131) = v131.run_approved(v131_task, "a-v131")
+    assert status == 200, run_v131
+    assert run_v131["result"]["version"] == "1.3", run_v131
+    assert "body" not in run_v131["result"], run_v131
+    assert run_v131["result"]["task_id"] == "v131-plan"
+    ok("LBP 1.3.1 tasks accept 1.3 plan/output semantics while legacy results remain labeled 1.3")
+
+    mutate_131 = {
+        "protocol": "lbp",
+        "version": "1.3.1",
+        "id": "v131-mutate",
+        "operation": {
+            "type": "mcp.mutate",
+            "server": "workspace",
+            "calls": [{"id": "edit", "tool": "apply_patch", "arguments": {}}],
+        },
+    }
+    mutate_131_conv = Conversation(port, conv_id("v131-mutate")).begin()
+    reg_mutate_131 = mutate_131_conv.register(mutate_131, "a-v131-mutate")
+    assert reg_mutate_131["task_id"] == "v131-mutate", reg_mutate_131
+    mutate_131_conv.act("abandon_task", registration=reg_mutate_131["registration_id"], reason="protocol regression only")
+
+    mutate_12 = dict(mutate_131)
+    mutate_12["version"] = "1.2"
+    mutate_12["id"] = "v12-mutate"
+    mutate_12_conv = Conversation(port, conv_id("v12-mutate")).begin()
+    status, body = mutate_12_conv.try_act("register_task", assistant_turn_id="a-v12-mutate", task=mutate_12)
+    assert status == 400 and "requires LBP 1.3 or 1.3.1" in body["error"], body
+    ok("mcp.mutate accepts 1.3.1 task semantics and still rejects 1.2")
 
     # ------------------------------------------------------- conversation state
     section("conversation identity and enable baseline")
@@ -614,25 +660,22 @@ def run_suite(port, project, target, outside, state_dir):
         if index == 1:
             k.act("task_delivery_status", registration=reg, status="inserted")
             k.acknowledge(reg, f"ack{index}")
-    assert k.state["phase"] == "checkpoint", k.state["phase"]
+    assert k.state["phase"] == "result_ready", k.state["phase"]
     assert k.state["active_chain"]["window"] == 0
-    ok("the window fills and the chain reaches a checkpoint, never a deadlock")
+    assert k.state["active_chain"]["window_task_count"] == 2
+    ok("filling the window never creates a hard checkpoint pause")
 
     status, body = k.try_act("register_task", assistant_turn_id="a3", task=task("cp-3", "read_file", target))
     assert status == 400, body
-    ok("no new task registers while a checkpoint is pending")
-
-    k.act("request_continue")
-    assert k.state["active_chain"]["window"] == 0
-    assert k.state["active_chain"]["checkpoint_continue_requested"] is True
-    ok("requesting continuation does NOT advance the window on its own")
+    ok("no new task registers while the final result is still awaiting provider-confirmed delivery")
 
     reg2, result2 = results[1]
     k.act("task_delivery_status", registration=reg2, status="inserted")
     k.acknowledge(reg2, "ack2")
+    assert k.state["phase"] == "awaiting_assistant", k.state["phase"]
     assert k.state["active_chain"]["window"] == 1
     assert k.state["active_chain"]["window_task_count"] == 0
-    ok("the window advances only on acknowledged provider submission")
+    ok("the full window rolls automatically only after provider-confirmed result submission")
 
     status, body = k.try_acknowledge(reg2, "ack2")
     assert status == 200 and k.state["active_chain"]["window"] == 1
@@ -646,6 +689,46 @@ def run_suite(port, project, target, outside, state_dir):
     assert status == 400 and "delivery_id does not match" in body["error"], body
     ok("a forged delivery marker cannot be acknowledged even with the right task id")
 
+    resize = Conversation(port, conv_id("checkpoint-resize")).begin(checkpoint_size=4)
+    for index in (1, 2):
+        reg_rz, (status, run_rz) = resize.run_approved(
+            task(f"resize-{index}", "read_file", target), f"rz-a{index}"
+        )
+        assert status == 200, run_rz
+        resize.act("task_execution_status", registration=reg_rz, status="completed")
+        resize.act("task_delivery_status", registration=reg_rz, status="inserted")
+        resize.acknowledge(reg_rz, f"rz-ack-{index}")
+    assert resize.state["active_chain"]["window"] == 0
+    assert resize.state["active_chain"]["window_task_count"] == 2
+    assert resize.state["active_chain"]["window_limit"] == 4
+
+    resize.act("configure", checkpoint_size=1, unknown_recovery="auto_continue")
+    assert resize.state["checkpoint_size"] == 1
+    assert resize.state["unknown_recovery"] == "auto_continue"
+    assert resize.state["active_chain"]["window"] == 0
+    assert resize.state["active_chain"]["window_task_count"] == 2
+    assert resize.state["active_chain"]["window_limit"] == 1
+    ok("shrinking checkpoint size changes the next boundary without retroactive rollover")
+
+    reg_rz3, (status, run_rz3) = resize.run_approved(task("resize-3", "read_file", target), "rz-a3")
+    assert status == 200, run_rz3
+    resize.act("task_execution_status", registration=reg_rz3, status="completed")
+    resize.act("task_delivery_status", registration=reg_rz3, status="inserted")
+    resize.acknowledge(reg_rz3, "rz-ack-3")
+    assert resize.state["active_chain"]["window"] == 1
+    assert resize.state["active_chain"]["window_task_count"] == 0
+    assert resize.state["active_chain"]["window_limit"] == 1
+    ok("a shrunken checkpoint rolls at the next provider-confirmed task boundary")
+
+    resize.act("configure", checkpoint_size=20)
+    assert resize.state["active_chain"]["window_limit"] == 20
+    assert resize.state["unknown_recovery"] == "auto_continue"
+    ok("growing checkpoint size applies immediately and preserves unknown recovery")
+
+    status, body = resize.try_act("configure", unknown_recovery="invalid")
+    assert status == 400 and "unknown_recovery must be manual or auto_continue" in body["error"], body
+    ok("unknown recovery accepts only manual or auto_continue")
+
     # -------------------------------------------------------- wedge resistance
     section("wedge resistance")
 
@@ -654,14 +737,23 @@ def run_suite(port, project, target, outside, state_dir):
     assert w.state["phase"] == "task_registered"
     w.act("abandon_task", registration=reg_w, reason="denied_by_user")
     assert w.state["phase"] == "awaiting_assistant"
-    assert w.state["active_chain"]["window_task_count"] == 0
-    ok("a denied task releases its window slot and the chain stays usable")
+    assert w.state["active_chain"]["window_task_count"] == 1
+    ok("an abandoned task keeps its checkpoint slot and the chain stays usable")
 
     reg_w2 = w.register(task("wedge-2", "read_file", target), "a2")["registration_id"]
     assert reg_w2 != reg_w
     ok("a new task registers after an abandoned one")
 
-    status, body = w.try_act("task_execution_status", registration=reg_w2, status="totally-made-up")
+    w.act("abandon_task", registration=reg_w2, reason="denied_by_user")
+    reg_w3 = w.register(task("wedge-3", "read_file", target), "a3")["registration_id"]
+    w.act("abandon_task", registration=reg_w3, reason="denied_by_user")
+    assert w.state["phase"] == "awaiting_assistant"
+    assert w.state["active_chain"]["window"] == 1
+    assert w.state["active_chain"]["window_task_count"] == 0
+    ok("an abandoned task that fills the window rolls automatically without a hard checkpoint")
+
+    reg_w4 = w.register(task("wedge-4", "read_file", target), "a4")["registration_id"]
+    status, body = w.try_act("task_execution_status", registration=reg_w4, status="totally-made-up")
     assert status == 400 and "execution status must be one of" in body["error"], body
     ok("task status transitions are enum-validated")
 
@@ -708,7 +800,6 @@ def run_suite(port, project, target, outside, state_dir):
     assert status == 200, run_c1
     ch.act("task_execution_status", registration=reg_c1, status="completed")
     ch.act("task_delivery_status", registration=reg_c1, status="inserted")
-    ch.act("request_continue")
     ch.acknowledge(reg_c1, "cack1")
     assert ch.state["active_chain"]["window"] == 1
     reg_c2 = ch.register(task("cs-2", "apply_patch", target), "a2")["registration_id"]
@@ -731,6 +822,14 @@ def run_suite(port, project, target, outside, state_dir):
     m.act("task_execution_status", registration=reg_m, status="unknown")
     assert m.state["phase"] == "stopped" and m.state["stopped_reason"] == "unknown_mutation_state"
     ok("an unknown mutation stops the chain immediately, never waits at a checkpoint")
+
+    m.act("acknowledge_unknown", registration=reg_m)
+    unknown_row = next(item for item in m.state["recent_tasks"] if item["registration_id"] == reg_m)
+    assert m.state["phase"] == "awaiting_assistant"
+    assert m.state["current_registration"] is None
+    assert unknown_row["execution_status"] == "unknown"
+    assert unknown_row.get("unknown_acknowledged_at")
+    ok("acknowledging an unknown resumes the chain without changing or retrying the unknown task")
 
     m2 = Conversation(port, conv_id("mutation-404")).begin()
     reg_m2 = m2.register(task("mut-404", "flaky_write", target), "a1")["registration_id"]
@@ -815,14 +914,6 @@ def run_suite(port, project, target, outside, state_dir):
     assert status == 200, preview
     pp.act("abandon_task", registration=reg, reason="test")
     ok("ordinary slash-bearing text is not mistaken for a path")
-
-    ff = Conversation(port, conv_id("freeform")).begin()
-    reg_ff = ff.register(task_args("ff-1", "delete_all", {
-        "path": str(target), "patch": "--- a/x\n+++ b/x",
-    }), "a1")["registration_id"]
-    status, body = ff.preview(reg_ff)
-    assert status == 400 and "freeform_policy_denied" in body["error"], body
-    ok("a write tool with a free-form payload needs explicit acknowledgement")
 
     v = Conversation(port, conv_id("verify")).begin()
     reg_v = v.register(task_args("v-1", "run_command", {
@@ -961,6 +1052,7 @@ class Conversation:
 
     def acknowledge(self, registration, turn_id, **extra):
         payload = {**self.delivery_for(registration), **extra}
+        self.act("observe_submission", registration=registration, turn_id=turn_id, **payload)
         return self.act("acknowledge_submission", registration=registration, turn_id=turn_id, **payload)
 
     def try_acknowledge(self, registration, turn_id, **extra):
@@ -1018,9 +1110,6 @@ def main():
                 "write": True,
                 "allow_destructive": True,
                 "roots": [str(project)],
-                # Explicit acknowledgement that roots cannot constrain these
-                # tools' free-form payload arguments.
-                "freeform_write_tools": ["apply_patch", "failing_patch", "second_patch"],
             }
         }
         (state / "servers.json").write_text(json.dumps(servers))
@@ -1030,7 +1119,7 @@ def main():
         env["HOME"] = str(home)
         env["LOCAL_MCP_BRIDGE_PORT"] = str(bridge_port)
         proc = subprocess.Popen(["python3", str(ROOT / "daemon.py")], env=env,
-                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                                stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT, text=True)
         try:
             wait_health(bridge_port)
             run_suite(bridge_port, project, target, outside, state)

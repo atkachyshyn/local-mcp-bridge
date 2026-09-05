@@ -169,8 +169,8 @@ const adapter = globalThis.LBP_PROVIDER_ADAPTER;
 
 section('protocol freeze');
 
-check('LBP 1.2 and 1.3 are the supported runtime versions', () => {
-  assert.deepEqual([...LBP.SUPPORTED_TASK_VERSIONS].sort(), ['1.2', '1.3']);
+check('LBP 1.2, 1.3 and 1.3.1 are the supported runtime versions', () => {
+  assert.deepEqual([...LBP.SUPPORTED_TASK_VERSIONS].sort(), ['1.2', '1.3', '1.3.1']);
 });
 
 check('LBP 1.1 is rejected, not coerced', () => {
@@ -192,11 +192,19 @@ check('version defaults to 1.2', () => {
   assert.equal(task.version, '1.2');
 });
 
-check('mcp.mutate requires 1.3', () => {
+check('mcp.mutate accepts 1.3 and 1.3.1 task semantics but rejects 1.2', () => {
+  for (const version of ['1.3', '1.3.1']) {
+    const task = LBP.normalizeTask({
+      protocol: 'lbp', version, id: `mutate-on-${version}`,
+      operation: { type: 'mcp.mutate', server: 'workspace', calls: [{ id: 'a', tool: 'apply_patch', arguments: {} }] }
+    });
+    assert.equal(task.version, version);
+    assert.equal(task.operation.type, 'mcp.mutate');
+  }
   assert.throws(() => LBP.normalizeTask({
     protocol: 'lbp', version: '1.2', id: 'mutate-on-12',
     operation: { type: 'mcp.mutate', server: 'workspace', calls: [{ id: 'a', tool: 'apply_patch', arguments: {} }] }
-  }), /requires LBP 1\.3/);
+  }), /requires LBP 1\.3 or 1\.3\.1/);
 });
 
 check('LBP 1.3 task plan and outputs normalize', () => {
@@ -356,7 +364,7 @@ check('assistant prose plus one plaintext task falls back to whole-turn text', (
   assert.equal(state.task.id, 'task-1');
 });
 
-check('a valid code-block task survives noisy whole-turn semantic text', () => {
+check('malformed whole rendered turn is rejected even if a nested code block looks valid', () => {
   const host = makeHost('assistant', [makeBlock(TASK_TEXT)], 'a1-noisy');
   const noisyTurnText = `<LBP_TASK>
 {
@@ -369,8 +377,7 @@ check('a valid code-block task survives noisy whole-turn semantic text', () => {
   Object.defineProperty(host, 'innerText', { configurable: true, get: () => noisyTurnText });
   Object.defineProperty(host, 'textContent', { configurable: true, get: () => noisyTurnText });
   const state = adapter.assistantTaskState(host);
-  assert.equal(state.kind, 'one', `code-block parse lost to noisy turn text: ${state.kind}`);
-  assert.equal(state.task.id, 'task-1');
+  assert.equal(state.kind, 'malformed', `whole rendered turn must be authoritative: ${state.kind}`);
 });
 
 check('partial task blocks are ignored until the assistant turn is complete', () => {
@@ -800,12 +807,53 @@ check('result recovery is acknowledged before human-turn reconciliation', () => 
 check('reload recovery replays stored results without a browser task ledger', () => {
   const coordinator = withoutComments(fs.readFileSync('extension/coordinator.js', 'utf8'));
   assert.ok(/function recoverPendingDelivery/.test(coordinator));
-  assert.ok(/"result_ready",\s*"checkpoint"/.test(coordinator),
-    'recovery must be limited to result delivery phases');
+  assert.ok(/daemonState\?\.phase\s*!==\s*"result_ready"/.test(coordinator),
+    'recovery must be limited to the result_ready delivery phase');
   assert.ok(/fetchStoredDelivery\(pending\.registrationId\)/.test(coordinator),
     'pending delivery must recover from the daemon journal after reload');
   assert.ok(/deliveryStatus === "inserted"[\s\S]*composerHoldsDelivery[\s\S]*submitResult/.test(coordinator),
     'auto retry should submit an inserted pending result without rewriting it');
+});
+
+check('unknown recovery UI distinguishes manual acknowledgement from auto recovery', () => {
+  const presentation = fs.readFileSync('extension/presentation.js', 'utf8');
+  assert.ok(presentation.includes('unknownRecovery && state.unknown_recovery === "auto_continue"'));
+  assert.ok(presentation.includes('Auto-resume after result confirmation'));
+  assert.ok(presentation.includes('Acknowledge and continue'));
+  const autoBranch = presentation.indexOf('unknownRecovery && state.unknown_recovery === "auto_continue"');
+  const manualButton = presentation.indexOf('Acknowledge and continue');
+  assert.ok(autoBranch >= 0 && manualButton > autoBranch, 'manual acknowledge button must be in the fallback branch after auto mode');
+});
+
+check('unknown auto-recovery happens only after provider-confirmed result acknowledgement', () => {
+  const coordinator = withoutComments(fs.readFileSync('extension/coordinator.js', 'utf8'));
+  const start = coordinator.indexOf('async function reconcileSubmittedResultTurn');
+  const end = coordinator.indexOf('function currentPendingRegistrationFor', start);
+  assert.ok(start >= 0 && end > start, 'result reconciliation function is missing');
+  const flow = coordinator.slice(start, end);
+  const submitted = flow.indexOf('await stateCall("acknowledge_submission"');
+  const unknown = flow.indexOf('await stateCall("acknowledge_unknown"');
+  assert.ok(submitted >= 0 && unknown > submitted,
+    'unknown recovery must occur only after provider-confirmed acknowledge_submission');
+  assert.ok(flow.includes('pending.executionStatus === "unknown"'));
+  assert.ok(flow.includes('daemonState?.unknown_recovery === "auto_continue"'));
+  assert.ok(flow.includes('daemonState?.phase === "stopped"'));
+  assert.ok(flow.includes('daemonState?.stopped_reason === "unknown_mutation_state"'));
+});
+
+check('interaction settings expose checkpoint size and unknown recovery without freeform policy', () => {
+  const coordinator = fs.readFileSync('extension/coordinator.js', 'utf8');
+  const content = fs.readFileSync('extension/content.js', 'utf8');
+  const optionsHtml = fs.readFileSync('extension/options.html', 'utf8');
+  const optionsJs = fs.readFileSync('extension/options.js', 'utf8');
+  assert.ok(optionsHtml.includes('Checkpoint size'));
+  assert.ok(optionsHtml.includes('id="interaction-unknown-recovery"'));
+  assert.ok(optionsHtml.includes('max="100"'));
+  assert.ok(coordinator.includes('unknown_recovery: next.unknown_recovery === "auto_continue"'));
+  assert.ok(content.includes('unknown_recovery: raw.unknown_recovery === "auto_continue"'));
+  assert.ok(optionsJs.includes('unknown_recovery'));
+  assert.equal(optionsHtml.includes('server-freeform-write'), false);
+  assert.equal(optionsJs.includes('freeform_write_tools'), false);
 });
 
 check('transport lifecycle has concise debug events', () => {
@@ -880,12 +928,15 @@ check('sidebar icons are real SVG, not rotated pseudo-element bars', () => {
 
 check('sidebar terminology uses steps and checkpoints', () => {
   const presentation = fs.readFileSync('extension/presentation.js', 'utf8');
+  const coordinator = fs.readFileSync('extension/coordinator.js', 'utf8');
   const options = fs.readFileSync('extension/options.html', 'utf8')
     + fs.readFileSync('extension/options.js', 'utf8');
   const visible = [presentation, options].join('\n');
   assert.equal(/Round trip|round trip|Auto-advance|Current round trip|Continue another \d+/.test(visible), false);
   assert.ok(presentation.includes('Current step'));
-  assert.ok(presentation.includes('Continue to next checkpoint'));
+  assert.equal(presentation.includes('Continue to next checkpoint'), false);
+  assert.equal(coordinator.includes('request_continue'), false);
+  assert.equal(coordinator.includes('continueCheckpoint'), false);
   assert.ok(presentation.includes('until checkpoint'));
   assert.ok(presentation.includes('Auto-continue'));
 });

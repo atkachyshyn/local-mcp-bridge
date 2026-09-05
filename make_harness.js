@@ -10,7 +10,7 @@ const items = TITLES.map((t,i)=>({id:'p'+(i+1),phase:'execute',title:t,status:i<
 const base = new Date(); base.setHours(14,2,11,0);
 const STATE = {schema:2,conversation_id:'conv-'+'0'.repeat(32),revision:9,enabled:true,workflow_attached:true,
   mode:'auto_continue',checkpoint_size:12,phase:'executing',
-  active_chain:{chain_id:'c1',human_turn_id:'msg:u1',window:0,window_limit:12,window_task_count:3,total_task_count:3,checkpoint_continue_requested:false},
+  active_chain:{chain_id:'c1',human_turn_id:'msg:u1',window:0,window_limit:12,window_task_count:3,total_task_count:3},
   current_task_id:'t3',current_registration:'r3',
   plan:{id:'pl',revision:1,title:'Stabilize',items,begun:true,chain_id:'c1'},
   recent_tasks:items.slice(0,3).map((it,i)=>({registration_id:'r'+(i+1),task_id:'t'+(i+1),title:it.title,sequence:i+1,window:0,window_position:i+1,plan_item_id:it.id,execution_status:i<2?'completed':'running',delivery_status:i<2?'submitted':'none',updated_at:Math.floor((base.getTime()+i*1000)/1000)})),
@@ -25,7 +25,7 @@ globalThis.LBP_COORDINATOR = {state:()=>STATE,stateStatus:()=>({kind:'ok'}),
   interaction:()=>interaction,taskViews:()=>views,
   setInteraction:(n)=>{interaction=n;},
   updateInteraction:(n)=>{interaction={...interaction,...n};STATE.mode=n.mode;return Promise.resolve();},
-  enable:()=>Promise.resolve(),stop:()=>Promise.resolve(),continueCheckpoint:()=>Promise.resolve(),
+  enable:()=>Promise.resolve(),stop:()=>Promise.resolve(),
   redeliverResult:()=>Promise.resolve(),addContextSource:()=>Promise.resolve(),
   removeContextSource:()=>Promise.resolve(),chooseContextFolder:()=>Promise.resolve({cancelled:true}),
   configuredContextSources:()=>Promise.resolve([])};

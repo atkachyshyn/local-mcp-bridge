@@ -11,10 +11,12 @@
   nodes.** Assistant prose may appear before or after a fenced/plain LBP task
   block, partial blocks are ignored, malformed/multiple tasks are rejected, and
   duplicate scans are idempotent through daemon registration.
-- **Result delivery only acknowledges observed provider turns.** Auto-send uses
-  the visible Send button first, falls back to provider form submission/Enter
-  only while the expected result is still in the composer, and advances daemon
-  state only after a new user turn semantically equals the stored LBP result.
+- **Result delivery is provider-confirmed in two phases.** Auto-send uses the
+  visible Send button first, falls back to provider form submission/Enter only
+  while the expected result is still in the composer, records the matching new
+  provider user turn with `observe_submission`, and calls
+  `acknowledge_submission` only after a later assistant turn proves the provider
+  accepted it. A click alone never advances daemon state.
 - **Pending result recovery survives reload and manual Send.** If a completed
   result is still pending delivery, the coordinator replays the stored daemon
   journal result instead of re-executing the MCP task. A manually submitted exact
@@ -31,6 +33,23 @@
   as a code block whose first line of content was the word `text`, so the turn
   no longer read as exactly one envelope and `parsePureResultEnvelope` refused
   it. Both the result envelope and the workflow bootstrap now use a bare fence.
+
+- **Checkpoint windows roll automatically; there is no hard checkpoint pause.**
+  Every registered task consumes one slot regardless of outcome. Provider-backed
+  terminal results roll only after provider confirmation; abandoned pre-dispatch
+  tasks roll immediately when they fill the boundary. Growing checkpoint size is
+  immediate, while shrinking below the consumed count defers rollover to the next
+  terminal boundary without rewriting history.
+- **LBP 1.3.1 task compatibility is live without mislabeling results.** Tasks may
+  use 1.3.1 with the same mutate/plan/output semantics as 1.3, while the daemon
+  continues to emit the legacy 1.3 result shape until 1.3.1 inline/file result
+  transport is implemented end to end.
+- **Removed the extra `freeform_write_tools` configuration gate.** Tool authority
+  continues to come from the MCP catalog/annotations plus the daemon's existing
+  classification, root, approval and destructive policies; there is no separate
+  operator-maintained free-form payload allowlist.
+- **Stabilization baseline is fully green:** 79 daemon checks, 68 browser checks,
+  15 sidebar-reference checks and 4 append-only transport invariant checks.
 
 ## 0.9.2 — 2026-09-03
 
@@ -59,19 +78,20 @@ stale/replay eligibility and approval-window identity.
   pathname, which collapsed every new chat in every tab into one bucket — and
   since `enabled` lives in that bucket, enabling once enabled every future new
   chat everywhere.
-- Approval leases are keyed on the conversation, not on a browser-supplied
-  session id. `chain_id` has been removed from the wire entirely; the daemon
-  derives the approval window as `chain_id + ".w" + window`, so the browser can
-  no longer pin an old window to keep a lease alive.
+- Approval leases are keyed on daemon-owned conversation scope, not on a
+  browser-supplied session id. `chain_id` has been removed from the wire entirely;
+  the daemon preserves an `approval_scope_id` across ordinary human follow-ups
+  and derives each lease window from that scope plus the daemon-owned window
+  number, so the browser cannot pin an old window to keep a lease alive.
 - Approvals are bound to the tool catalog as well as to server policy, so a
   server that relabels a tool between grant and use invalidates the lease.
 - Path-shaped relative values in unrecognized argument keys now fail closed.
   Only absolute values were checked, so `../../../.ssh/id_rsa` in an argument
   named `filename` escaped root containment entirely.
-- A write/destructive tool carrying a free-form payload argument (`patch`,
-  `content`, `old`, `new`, …) is refused unless the operator lists it in the new
-  per-server `freeform_write_tools`. Configured roots cannot constrain what is
-  inside such a payload, and for a patch tool that payload is the write target.
+- 0.9.2 temporarily added an extra daemon-specific free-form payload gate. The
+  current stabilization removes that additional configuration layer; MCP tool
+  metadata and the daemon's ordinary classification/root/approval policies remain
+  authoritative.
 
 ### Mutation semantics (LBP 1.3)
 
@@ -116,13 +136,13 @@ stale/replay eligibility and approval-window identity.
   locally but failed to reach the provider is no longer recorded as an execution
   failure, and `Re-deliver result` replays the stored result without re-entering
   MCP.
-- The checkpoint window advances only on acknowledged provider submission — a new
-  user turn whose content matches the daemon's stored canonical result. A click
-  is not proof, and a repeated acknowledgement cannot advance the window twice.
-- A denied or abandoned task releases its window slot. Previously a task that
-  registered and never reported terminal status wedged the chain permanently:
-  registration refused for capacity, continuation refused for having no pending
-  checkpoint.
+- Checkpoint windows advance automatically at terminal boundaries. Provider-backed
+  results use observed-then-provider-confirmed delivery before rollover; a click
+  is not proof, and repeated acknowledgement cannot advance the window twice.
+- Registration permanently consumes the task's checkpoint slot regardless of
+  outcome. Denied or abandoned tasks become terminal history items rather than
+  refunding capacity, and an abandoned task that fills the boundary rolls the
+  window automatically.
 - Conversation state carries a `revision`; every mutating call is a
   compare-and-swap, and one tab holds a renewable owner lease. Two tabs on one
   conversation can no longer both drive the state machine.
@@ -144,10 +164,12 @@ stale/replay eligibility and approval-window identity.
 
 ### Protocol
 
-- Runtime support is frozen to LBP 1.3 plus backward-compatible 1.2. LBP 1.1 is
-  rejected rather than coerced, and the `<LBP_TASK_V1>` / `<ATLAS_TASK_V1>`
-  envelopes are removed. Adds normative `protocol/LBP_V1_3.md`, including the
-  final plan, outputs and read-only context model.
+- Task parsing supports LBP 1.2, 1.3 and 1.3.1; 1.3.1 inherits the 1.3 task
+  semantics. LBP 1.1 is rejected rather than coerced, and the `<LBP_TASK_V1>` /
+  `<ATLAS_TASK_V1>` envelopes are removed. The daemon still emits legacy 1.3
+  results until the normative `protocol/LBP_V1_3_1.md` inline/file result body is
+  implemented end to end. `protocol/LBP_V1_3.md` remains the plan/outputs/context
+  baseline.
 
 ### Browser modules
 
@@ -173,11 +195,11 @@ stale/replay eligibility and approval-window identity.
 
 ### Tests
 
-- All three suites are green: 61 daemon checks, 42 browser checks and 12
-  sidebar-reference checks. Both behavioural suites were red before this release.
-  Coverage spans the conversation state machine, journaling and recovery,
-  mutation ambiguity, approval windows, plan/output metadata, provider
-  assumptions, and the rendered sidebar's wording.
+- The release suites were green across daemon, browser and sidebar-reference
+  coverage. Current unreleased stabilization counts are recorded above rather
+  than freezing historical counts here. Coverage spans the conversation state
+  machine, journaling and recovery, mutation ambiguity, approval windows,
+  plan/output metadata, provider assumptions, and rendered sidebar wording.
 
 ## 0.9.1 — 2026-09-02
 

@@ -45,9 +45,6 @@
     ],
     "approval_mode": "mutations",
     "always_approve_destructive": true,
-    "approval_escalation": "chain",
-    "freeform_write_tools": [
-      "apply_patch"
-    ]
+    "approval_escalation": "chain"
   }
 }

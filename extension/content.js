@@ -20,6 +20,7 @@
       next = {
         mode: raw.mode === "auto_continue" ? "auto_continue" : "manual",
         max_round_trips: Number.isFinite(max) && max >= 1 && max <= 100 ? Math.floor(max) : 12,
+        unknown_recovery: raw.unknown_recovery === "auto_continue" ? "auto_continue" : "manual",
         status_surface: raw.status_surface === "pill" ? "pill" : "panel"
       };
       coordinator.setInteraction(next);

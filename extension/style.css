@@ -377,12 +377,7 @@
 }
 
 .lbp-timeline-line {
-  position: absolute;
-  left: 9.3px;
-  top: 22.6px;
-  bottom: 11px;
-  width: 2px;
-  background: rgba(192,199,208,.38);
+  display: none;
 }
 
 .lbp-timeline-list {
@@ -391,6 +386,20 @@
   display: grid;
   gap: 0;
   padding-right: 7.7px;
+}
+
+/* The rail belongs to the scroll CONTENT, not the scroll viewport. Keeping it
+   on the list makes it span every rendered task even when the timeline scrolls. */
+.lbp-timeline-list::before {
+  content: "";
+  position: absolute;
+  z-index: 0;
+  left: 9.3px;
+  top: 16px;
+  bottom: 2.2px;
+  width: 2px;
+  background: rgba(192,199,208,.38);
+  pointer-events: none;
 }
 
 .lbp-step {
@@ -725,7 +734,8 @@
 }
 
 /* With no steps the rail would otherwise strike through the empty-state text. */
-.lbp-timeline[data-empty="true"] .lbp-timeline-line { display: none; }
+.lbp-timeline[data-empty="true"] .lbp-timeline-line,
+.lbp-timeline[data-empty="true"] .lbp-timeline-list::before { display: none; }
 
 .lbp-timeline-empty {
   padding: 15.4px 2px;

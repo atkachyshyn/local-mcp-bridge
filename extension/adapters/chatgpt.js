@@ -261,45 +261,98 @@ globalThis.LBP_PROVIDER_ADAPTER = (() => {
   }
 
   function tasksIn(host) {
-    const { blockSources, turnSources } = taskSources(host);
-    const blockTasks = extractTasksFromSources(host, blockSources);
-    if (blockTasks.length) return blockTasks;
-    return extractTasksFromSources(host, turnSources);
+    if (!host) return [];
+
+    // Task parsing must follow the provider's rendered message text. ChatGPT's
+    // DOM contains nested block elements inside code surfaces; rebuilding that
+    // tree with semanticText() can inject structural newlines that are not in
+    // the visible message and can split an otherwise valid LBP envelope.
+    const text = renderedNodeText(host);
+
+    logTransport("assistant_text_extracted", {
+      turn_id: host?.getAttribute?.("data-message-id") || null,
+      length: text.length,
+      has_open_tag: text.includes("<LBP_TASK>"),
+      has_close_tag: text.includes("</LBP_TASK>"),
+      open_index: text.indexOf("<LBP_TASK>"),
+      close_index: text.indexOf("</LBP_TASK>")
+    });
+
+    return globalThis.LBP.extractTasks(text)
+      .map((task) => ({
+        task,
+        host,
+        source: "turn"
+      }));
   }
 
-  // The whole assistant response is one unit. Two tasks in two separate code
-  // blocks of one message is still two tasks, and is rejected -- the caller gets
-  // {kind:"multiple"} rather than a silently-chosen first task.
   function assistantTaskState(host) {
     if (!host) return { kind: "none" };
-    const found = tasksIn(host);
-    const malformed = found.filter((entry) => entry.task?.__parse_error);
 
-    // The provider re-renders a message while and after it streams, which can
-    // leave the same task in more than one code block. That is ONE task shown
-    // twice, not a multi-task reply -- collapsing identical tasks first keeps
-    // the one-task-per-turn rule meaningful while stopping a duplicated render
-    // from wrongly killing the chain.
+    const found = tasksIn(host);
+
+    const malformed = found.filter(
+      (entry) => entry.task?.__parse_error
+    );
+
     const seen = new Set();
     const valid = [];
+
     for (const entry of found) {
       if (entry.task?.__parse_error) continue;
+
       const fingerprint = globalThis.LBP.canonicalJson(entry.task);
+
       if (seen.has(fingerprint)) continue;
+
       seen.add(fingerprint);
       valid.push(entry);
     }
 
-    // Two genuinely different tasks in one reply is still a violation.
-    if (valid.length > 1) return { kind: "multiple", count: valid.length };
-    if (malformed.length) return { kind: "malformed", error: malformed[0].task.__parse_error };
+    logTransport("lbp_parse_result", {
+      turn_id: host?.getAttribute?.("data-message-id") || null,
+      found_count: found.length,
+      malformed_count: malformed.length,
+      valid_count: valid.length
+    });
+
+    if (valid.length > 1) {
+      logTransport("lbp_task_parsed", {
+        turn_id: host?.getAttribute?.("data-message-id") || null,
+        task_id: valid[0].task.id
+      });
+
+      return {
+        kind: "multiple",
+        count: valid.length
+      };
+    }
+
+    if (malformed.length) {
+      logTransport("lbp_task_malformed", {
+        turn_id: host?.getAttribute?.("data-message-id") || null,
+        error: malformed[0]?.task?.__parse_error || null
+      });
+
+      return {
+        kind: "malformed",
+        error: malformed[0].task.__parse_error
+      };
+    }
+
     if (valid.length === 1) {
+      logTransport("lbp_task_parsed", {
+        turn_id: host?.getAttribute?.("data-message-id") || null,
+        task_id: valid[0].task.id
+      });
+
       return {
         kind: "one",
         task: valid[0].task,
         fingerprint: globalThis.LBP.canonicalJson(valid[0].task)
       };
     }
+
     return { kind: "none" };
   }
 
@@ -684,6 +737,25 @@ globalThis.LBP_PROVIDER_ADAPTER = (() => {
     return { submitted: false, reason: "no_provider_acknowledgement" };
   }
 
+  function providerTurnIdSnapshot() {
+    const userIds = new Set();
+    const assistantIds = new Set();
+
+    for (const host of document.querySelectorAll(
+      '[data-message-author-role][data-message-id]'
+    )) {
+      const id = host.getAttribute("data-message-id");
+      const role = host.getAttribute("data-message-author-role");
+
+      if (!id) continue;
+
+      if (role === "user") userIds.add(id);
+      if (role === "assistant") assistantIds.add(id);
+    }
+
+    return { userIds, assistantIds };
+  }
+
   return Object.freeze({
     id: "chatgpt",
     providerHost: () => location.hostname,
@@ -713,6 +785,7 @@ globalThis.LBP_PROVIDER_ADAPTER = (() => {
     insertResult,
     prependComposerText,
     onBeforeUserSend,
-    submitAndAwaitAcknowledgement
+    submitAndAwaitAcknowledgement,
+    providerTurnIdSnapshot,
   });
 })();

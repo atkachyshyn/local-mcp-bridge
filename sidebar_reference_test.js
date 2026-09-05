@@ -76,8 +76,7 @@ const STATE = {
   phase: 'executing',
   active_chain: {
     chain_id: 'chain-1', human_turn_id: 'msg:u1', window: 0,
-    window_limit: 12, window_task_count: 3, total_task_count: 3,
-    checkpoint_continue_requested: false
+    window_limit: 12, window_task_count: 3, total_task_count: 3
   },
   current_task_id: 't3',
   current_registration: 'r3',
@@ -105,6 +104,8 @@ for (const key of ['document', 'Node', 'Element', 'HTMLElement', 'HTMLButtonElem
   global[key] = win[key];
 }
 global.window = win;
+global.requestAnimationFrame = win.requestAnimationFrame.bind(win);
+global.cancelAnimationFrame = win.cancelAnimationFrame.bind(win);
 global.navigator = win.navigator;
 global.location = { hostname: 'chatgpt.com', pathname: '/c/x' };
 global.crypto = { randomUUID: () => 'uuid-0000' };
@@ -122,13 +123,13 @@ const taskViews = new Map([
 
 globalThis.LBP_COORDINATOR = {
   state: () => STATE,
-  stateStatus: () => ({ kind: 'ok' }),
+  stateStatus: () => ({ kind: 'ready' }),
   status: () => ({ kind: 'connected', text: 'Connected', detail: '', busy: false }),
   identity: () => ({ bridgeVersion: '0.9.2', lbpVersion: '1.3' }),
   interaction: () => INTERACTION,
   taskViews: () => taskViews,
   setInteraction() {}, updateInteraction: async () => {},
-  enable: async () => {}, stop: async () => {}, continueCheckpoint: async () => {},
+  enable: async () => {}, stop: async () => {},
   redeliverResult: async () => {}, addContextSource: async () => {},
   removeContextSource: async () => {}, chooseContextFolder: async () => ({ cancelled: true }),
   configuredContextSources: async () => []

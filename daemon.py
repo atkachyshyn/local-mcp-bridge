@@ -20,7 +20,7 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Iterable
 
-VERSION = "0.9.2"
+VERSION = "0.9.2.2"
 LBP_VERSION = "1.3"
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("LOCAL_MCP_BRIDGE_PORT", os.environ.get("ATLAS_ARMS_PORT", "8765")))
@@ -196,15 +196,6 @@ def validate_server_config(name: str, cfg: Any) -> dict[str, Any]:
         )
     always_approve_destructive = bool(cfg.get("always_approve_destructive", True))
 
-    # Explicit operator acknowledgement that configured roots cannot constrain
-    # these tools' free-form payload arguments. Deny-by-default.
-    freeform_raw = cfg.get("freeform_write_tools", [])
-    if not isinstance(freeform_raw, list):
-        raise ValueError(f"MCP server {name!r}: freeform_write_tools must be an array")
-    freeform_write_tools = sorted({
-        item for item in freeform_raw if isinstance(item, str) and item.strip()
-    })
-
     return {
         "transport": "http",
         "endpoint": endpoint,
@@ -219,7 +210,6 @@ def validate_server_config(name: str, cfg: Any) -> dict[str, Any]:
         "approval_mode": approval_mode,
         "approval_escalation": approval_escalation,
         "always_approve_destructive": always_approve_destructive,
-        "freeform_write_tools": freeform_write_tools,
     }
 
 
@@ -309,7 +299,7 @@ PHASES = {
 }
 
 EXECUTION_STATUSES = {"registered", "running", "completed", "error", "unknown"}
-DELIVERY_STATUSES = {"none", "inserted", "submitted", "failed", "withheld"}
+DELIVERY_STATUSES = {"none", "inserted", "observed", "submitted", "failed", "withheld"}
 PLAN_ITEM_STATUSES = {"pending", "current", "completed", "error", "unknown", "skipped"}
 OUTPUT_STATUSES = {"pending", "produced", "failed", "unknown"}
 
@@ -369,6 +359,7 @@ def default_conversation_state(conversation_id: str) -> dict[str, Any]:
         "workflow_attached": False,
         "mode": "manual",
         "checkpoint_size": 12,
+        "unknown_recovery": "manual",
 
         "phase": "disabled",
         "stopped_reason": None,
@@ -392,6 +383,7 @@ def default_conversation_state(conversation_id: str) -> dict[str, Any]:
         "current_registration": None,
 
         "recent_tasks": [],
+        "total_task_count": 0,
         "plan": None,
         "outputs": [],
         "context": {"sources": [], "constraints": []},
@@ -675,11 +667,12 @@ def conversation_context_projection(state: dict[str, Any]) -> dict[str, Any]:
 def conversation_public_state(state: dict[str, Any]) -> dict[str, Any]:
     out = dict(state)
     chain = state.get("active_chain") or {}
-    chain_id = chain.get("chain_id")
+    approval_scope_id = chain.get("approval_scope_id") or chain.get("chain_id")
     window = int(chain.get("window", 0))
-    # Derived here and nowhere else. The browser never sends, chooses or
-    # influences this value; it is echoed back for display only.
-    out["approval_window_id"] = f"{chain_id}.w{window}" if chain_id else None
+    # Derived here and nowhere else. Human-turn chain identity is deliberately
+    # separate from checkpoint approval scope, which survives genuine follow-up
+    # turns until the configured checkpoint boundary is reached.
+    out["approval_window_id"] = f"{approval_scope_id}.w{window}" if approval_scope_id else None
     owner = state.get("owner") or {}
     out["owner"] = {"expires_at": owner.get("expires_at")} if owner else None
     out["context"] = conversation_context_projection(state)
@@ -712,8 +705,8 @@ def _owner_active(state: dict[str, Any], now: float) -> dict[str, Any] | None:
 OWNER_GUARDED_ACTIONS = {
     "arm_human_send", "observe_user_turn", "observe_assistant_turn",
     "assistant_no_task", "register_task", "abandon_task",
-    "task_execution_status", "task_delivery_status", "acknowledge_submission",
-    "request_continue",
+    "task_execution_status", "task_delivery_status", "observe_submission", "acknowledge_submission",
+    "acknowledge_unknown",
 }
 
 
@@ -735,14 +728,16 @@ def _require_owner(state: dict[str, Any], tab_token: Any) -> None:
 
 
 def _new_chain(state: dict[str, Any], human_turn_id: str) -> None:
+    previous = state.get("active_chain") if isinstance(state.get("active_chain"), dict) else {}
     state["active_chain"] = {
         "chain_id": secrets.token_hex(16),
+        "approval_scope_id": previous.get("approval_scope_id") or previous.get("chain_id") or secrets.token_hex(16),
         "human_turn_id": human_turn_id,
-        "window": 0,
-        "window_limit": int(state.get("checkpoint_size", 12)),
-        "window_task_count": 0,
-        "total_task_count": 0,
-        "checkpoint_continue_requested": False,
+        "window": int(previous.get("window", 0)),
+        "window_limit": int(previous.get("window_limit", state.get("checkpoint_size", 12))),
+        "window_task_count": int(previous.get("window_task_count", 0)),
+        "total_task_count": int(state.get("total_task_count", 0)),
+        "checkpoint_resize_pending": bool(previous.get("checkpoint_resize_pending", False)),
     }
     state["current_task_id"] = None
     state["current_registration"] = None
@@ -761,26 +756,46 @@ def update_conversation_state(conversation_id: str, action: str, payload: dict[s
         if action == "get":
             return conversation_public_state(state)
 
-        # Compare-and-swap. Every mutating call carries the revision the caller
-        # last saw. This is what makes two tabs safe: the loser's write is
-        # rejected instead of silently double-applying, which is how a single
-        # submission used to be able to advance the checkpoint window twice.
-        expected = payload.get("expected_revision")
-        if expected is not None:
-            if int(expected) != int(state.get("revision", 0)):
-                raise ConversationConflict(conversation_public_state(state))
+        # Diagnostic correlation only. Never log task bodies, MCP arguments,
+        # approval tokens, or other payload contents.
+        debug_extra: dict[str, Any] = {}
+        turn_id = payload.get("turn_id")
+        if isinstance(turn_id, str) and turn_id:
+            debug_extra["turn_id"] = turn_id[:256]
+        assistant_turn_id = payload.get("assistant_turn_id")
+        if isinstance(assistant_turn_id, str) and assistant_turn_id:
+            debug_extra["assistant_turn_id"] = assistant_turn_id[:256]
+        task = payload.get("task")
+        if isinstance(task, dict) and isinstance(task.get("id"), str):
+            debug_extra["task_id"] = task["id"][:256]
+        registration = payload.get("registration")
+        if isinstance(registration, str) and registration:
+            debug_extra["registration"] = registration[:64]
 
-        # Ownership guards the actions that DRIVE the conversation, never the
-        # ones the human explicitly asks for. Safety against two tabs already
-        # comes from the revision CAS, the journal, and acknowledge_submission
-        # being idempotent on the provider turn id -- the lease is belt and
-        # braces on top of that. Blocking a user's own click on Auto-continue or
-        # Enable bought nothing and locked people out of their own tab.
-        if action in OWNER_GUARDED_ACTIONS:
-            _require_owner(state, payload.get("tab_token"))
+        _debug_state(f"{action}_before", state, **debug_extra)
 
-        extra = handler(state, payload) or {}
-        state = save_conversation_state(state)
+        try:
+            expected = payload.get("expected_revision")
+            if expected is not None:
+                if int(expected) != int(state.get("revision", 0)):
+                    raise ConversationConflict(conversation_public_state(state))
+
+            if action in OWNER_GUARDED_ACTIONS:
+                _require_owner(state, payload.get("tab_token"))
+
+            extra = handler(state, payload) or {}
+            state = save_conversation_state(state)
+        except Exception as exc:
+            _debug_state(
+                f"{action}_error",
+                state,
+                error=f"{type(exc).__name__}: {exc}",
+                **debug_extra,
+            )
+            raise
+
+        _debug_state(f"{action}_after", state, **debug_extra)
+
         public = conversation_public_state(state)
         public.update(extra)
         return public
@@ -819,13 +834,21 @@ def _act_configure(state: dict[str, Any], payload: dict[str, Any]) -> dict[str, 
     checkpoint_size = int(payload.get("checkpoint_size", state.get("checkpoint_size", 12)))
     if checkpoint_size < 1 or checkpoint_size > 100:
         raise ValueError("checkpoint_size must be 1..100")
+    unknown_recovery = payload.get("unknown_recovery", state.get("unknown_recovery", "manual"))
+    if unknown_recovery not in {"manual", "auto_continue"}:
+        raise ValueError("unknown_recovery must be manual or auto_continue")
     state["mode"] = mode
     state["checkpoint_size"] = checkpoint_size
+    state["unknown_recovery"] = unknown_recovery
     chain = state.get("active_chain")
     if isinstance(chain, dict):
-        # Never shrink a window the user is already inside; the new limit takes
-        # effect at the next checkpoint.
-        chain["window_limit"] = max(int(chain.get("window_limit", checkpoint_size)), 0) or checkpoint_size
+        # A shrink that makes the current window already full/overfull never
+        # rolls retroactively and must not pre-roll merely because another task
+        # is registered. The next terminal task boundary performs the rollover.
+        previous_limit = int(chain.get("window_limit", state.get("checkpoint_size", 12)))
+        current_count = int(chain.get("window_task_count", 0))
+        chain["checkpoint_resize_pending"] = checkpoint_size < previous_limit and current_count >= checkpoint_size
+        chain["window_limit"] = checkpoint_size
     return {}
 
 
@@ -963,18 +986,6 @@ def _act_assistant_no_task(state: dict[str, Any], payload: dict[str, Any]) -> di
     return {}
 
 
-def _act_request_continue(state: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
-    chain = state.get("active_chain")
-    if not isinstance(chain, dict) or state.get("phase") != "checkpoint":
-        raise ValueError("no checkpoint is pending")
-    # Requesting continuation does NOT advance the window. The window advances in
-    # acknowledge_submission, only once the provider has actually accepted the
-    # exact stored result -- otherwise a failed submission would mint a fresh
-    # approval window for free.
-    chain["checkpoint_continue_requested"] = True
-    return {}
-
-
 def _act_stop(state: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
     state["phase"] = "stopped"
     reason = payload.get("reason")
@@ -997,7 +1008,6 @@ CONVERSATION_ACTIONS: dict[str, Any] = {
     "observe_user_turn": _act_observe_user_turn,
     "observe_assistant_turn": _act_observe_assistant_turn,
     "assistant_no_task": _act_assistant_no_task,
-    "request_continue": _act_request_continue,
     "stop": _act_stop,
 }
 
@@ -1191,18 +1201,30 @@ def _act_register_task(state: dict[str, Any], payload: dict[str, Any]) -> dict[s
                 )
 
         window_limit = int(chain.get("window_limit", state.get("checkpoint_size", 12)))
-        if int(chain.get("window_task_count", 0)) >= window_limit:
-            # Window exhaustion and checkpoint-pending are the same condition,
-            # derived from one number. Setting the phase here means a chain can
-            # never reach a state where registration is refused for capacity but
-            # request_continue is refused for having no pending checkpoint.
-            state["phase"] = "checkpoint"
-            raise ValueError("checkpoint_required")
+        if int(chain.get("window_task_count", 0)) >= window_limit and not chain.get("checkpoint_resize_pending"):
+            # This version has no persisted checkpoint artifact. Reaching the
+            # window limit therefore advances bookkeeping instead of pausing.
+            chain["window"] = int(chain.get("window", 0)) + 1
+            chain["window_task_count"] = 0
+            chain["window_limit"] = int(state.get("checkpoint_size", 12))
+            evict_superseded_chain_leases(
+                chain.get("approval_scope_id") or chain.get("chain_id"),
+                int(chain["window"]),
+            )
+            window_limit = int(chain["window_limit"])
 
         _register_plan_if_needed(state, task, chain)
 
         position = int(chain.get("window_task_count", 0)) + 1
-        sequence = int(chain.get("total_task_count", 0)) + 1
+        recent_sequence = max(
+            (int(item.get("sequence") or 0) for item in state.get("recent_tasks", []) if isinstance(item, dict)),
+            default=0,
+        )
+        sequence = max(
+            int(state.get("total_task_count", 0)),
+            int(chain.get("total_task_count", 0)),
+            recent_sequence,
+        ) + 1
         registration_id = secrets.token_hex(16)
         record = {
             "key": key,
@@ -1225,6 +1247,7 @@ def _act_register_task(state: dict[str, Any], payload: dict[str, Any]) -> dict[s
             "delivery_status": "none",
             "delivery_id": None,
             "result_digest": None,
+            "observed_turn_id": None,
             "dispatched_at": None,
             "result": None,
             "created_at": int(time.time()),
@@ -1237,6 +1260,7 @@ def _act_register_task(state: dict[str, Any], payload: dict[str, Any]) -> dict[s
 
     chain["window_task_count"] = position
     chain["total_task_count"] = sequence
+    state["total_task_count"] = sequence
     state["current_task_id"] = task["id"]
     state["current_registration"] = registration_id
     state["phase"] = "task_registered"
@@ -1285,6 +1309,8 @@ def _journal_public(record: dict[str, Any]) -> dict[str, Any]:
         "delivery_status": record.get("delivery_status"),
         "delivery_id": record.get("delivery_id"),
         "result_digest": record.get("result_digest"),
+        "observed_turn_id": record.get("observed_turn_id"),
+        "unknown_acknowledged_at": record.get("unknown_acknowledged_at"),
         # Surfaced so the sidebar can show a completion time on a finished step,
         # as the approved reference does ("Completed - 14:02:11").
         "updated_at": record.get("updated_at"),
@@ -1465,12 +1491,40 @@ def _act_task_execution_status(state: dict[str, Any], payload: dict[str, Any]) -
         state["stopped_reason"] = "unknown_mutation_state"
         return {}
     if status in {"completed", "error"} and isinstance(chain, dict):
-        window_limit = int(chain.get("window_limit", state.get("checkpoint_size", 12)))
-        if int(record.get("window_position", 0)) >= window_limit:
-            state["phase"] = "checkpoint"
-        else:
-            state["phase"] = "result_ready"
+        # Delivery still completes when this task fills the current window.
+        # Rollover happens after the provider accepts the result turn.
+        state["phase"] = "result_ready"
     return {}
+
+
+def _act_acknowledge_unknown(state: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    """Explicitly acknowledge an ambiguous mutation and continue the same chain.
+
+    This does not retry the operation and does not change its execution status.
+    The unknown task remains in history and keeps its consumed checkpoint slot.
+    """
+    if state.get("phase") != "stopped" or state.get("stopped_reason") != "unknown_mutation_state":
+        raise ValueError("no unknown mutation is awaiting acknowledgement")
+
+    record = resolve_registration(payload.get("registration"))
+    if record.get("conversation_id") != state["conversation_id"]:
+        raise ValueError("registration does not belong to this conversation")
+    if state.get("current_registration") != record.get("registration_id"):
+        raise ValueError("registration is not the current unknown task")
+
+    with task_lock(record["key"]):
+        record = load_journal(record["key"]) or record
+        if record.get("execution_status") != "unknown":
+            raise ValueError("registration is not in unknown execution state")
+        record["unknown_acknowledged_at"] = int(time.time())
+        record = save_journal(record)
+
+    _project_recent_task(state, record)
+    state["current_registration"] = None
+    state["current_task_id"] = None
+    state["stopped_reason"] = None
+    state["phase"] = "awaiting_assistant"
+    return {"acknowledged": True}
 
 
 def _act_task_delivery_status(state: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
@@ -1491,13 +1545,46 @@ def _act_task_delivery_status(state: dict[str, Any], payload: dict[str, Any]) ->
     return {}
 
 
-def _act_acknowledge_submission(state: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
-    """The provider actually accepted the bridge result as a new user turn.
+def _act_observe_submission(state: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    """Record a matching user turn without claiming provider persistence."""
+    record = resolve_registration(payload.get("registration"))
+    if record.get("conversation_id") != state["conversation_id"]:
+        raise ValueError("registration does not belong to this conversation")
 
-    Verified against the daemon's own pending delivery binding. The browser only
-    reports a provider turn id plus the visible delivery marker id; it never has
-    to recover the full result JSON from ChatGPT's rendered DOM, because large
-    pasted content can become a provider attachment.
+    turn_id = payload.get("turn_id")
+    if not isinstance(turn_id, str) or not turn_id.strip():
+        raise ValueError("observe_submission requires the provider turn_id")
+    turn_id = turn_id.strip()[:256]
+
+    with task_lock(record["key"]):
+        record = load_journal(record["key"]) or record
+        record = _ensure_delivery_binding(record)
+        delivery_id = payload.get("delivery_id")
+        if not isinstance(delivery_id, str) or not delivery_id.strip():
+            raise ValueError("observe_submission requires delivery_id")
+        delivery_id = delivery_id.strip()[:128]
+        if delivery_id != record.get("delivery_id"):
+            raise ValueError("observed delivery_id does not match the pending delivery")
+        observed_digest = payload.get("result_digest")
+        if observed_digest is not None and observed_digest != record.get("result_digest"):
+            raise ValueError("observed result_digest does not match the pending delivery")
+        if record.get("delivery_status") == "submitted":
+            return {"observed": "known"}
+        record["delivery_status"] = "observed"
+        record["observed_turn_id"] = turn_id
+        record = save_journal(record)
+
+    _project_recent_task(state, record)
+    state["last_user_turn_id"] = turn_id
+    return {"observed": "new"}
+
+
+def _act_acknowledge_submission(state: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    """Finalize a previously observed result after provider confirmation.
+
+    The browser first records the matching rendered user turn with
+    observe_submission. A later provider response confirms that turn was accepted;
+    only then may this action mark delivery submitted and advance the checkpoint.
     """
     record = resolve_registration(payload.get("registration"))
     if record.get("conversation_id") != state["conversation_id"]:
@@ -1534,10 +1621,16 @@ def _act_acknowledge_submission(state: dict[str, Any], payload: dict[str, Any]) 
             save_journal(record)
             return {"acknowledged": "known"}
 
-        already = record.get("delivery_status") == "submitted"
+        if record.get("delivery_status") != "observed":
+            raise ValueError("submission must be observed before it can be acknowledged")
+        observed_turn_id = record.get("observed_turn_id")
+        if not isinstance(observed_turn_id, str) or observed_turn_id != turn_id:
+            raise ValueError("acknowledged turn_id does not match the observed submission turn")
+
+        already = False
         record["delivery_status"] = "submitted"
         record["submitted_delivery_id"] = delivery_id
-        record.setdefault("submitted_turn_id", turn_id)
+        record["submitted_turn_id"] = turn_id
         record = save_journal(record)
 
     _project_recent_task(state, record)
@@ -1546,14 +1639,18 @@ def _act_acknowledge_submission(state: dict[str, Any], payload: dict[str, Any]) 
         return {"acknowledged": "known"}
 
     chain = state.get("active_chain")
-    if isinstance(chain, dict) and chain.get("checkpoint_continue_requested"):
-        chain["window"] = int(chain.get("window", 0)) + 1
-        chain["window_task_count"] = 0
-        chain["window_limit"] = int(state.get("checkpoint_size", 12))
-        chain["checkpoint_continue_requested"] = False
-        # The approval window id is derived from chain_id + window, so advancing
-        # the window necessarily invalidates the previous window's chain lease.
-        evict_superseded_chain_leases(chain.get("chain_id"), int(chain["window"]))
+    if isinstance(chain, dict):
+        window_limit = int(chain.get("window_limit", state.get("checkpoint_size", 12)))
+        if int(chain.get("window_task_count", 0)) >= window_limit:
+            chain["window"] = int(chain.get("window", 0)) + 1
+            chain["window_task_count"] = 0
+            chain["window_limit"] = int(state.get("checkpoint_size", 12))
+            chain["checkpoint_resize_pending"] = False
+            # Advancing the approval window invalidates the previous window lease.
+            evict_superseded_chain_leases(
+                chain.get("approval_scope_id") or chain.get("chain_id"),
+                int(chain["window"]),
+            )
 
     if state.get("phase") != "stopped":
         state["phase"] = "awaiting_assistant"
@@ -1561,10 +1658,11 @@ def _act_acknowledge_submission(state: dict[str, Any], payload: dict[str, Any]) 
 
 
 def _release_registration(state: dict[str, Any], record: dict[str, Any], reason: str) -> dict[str, Any]:
-    """Release a registered-but-never-dispatched task and free its window slot.
+    """Release a registered-but-never-dispatched task without refunding history.
 
-    Only safe for a task that never dispatched. A task that reached `executing`
-    keeps its slot and its ambiguity: it may have changed something.
+    Registration creates the visible history item, so it permanently consumes
+    one checkpoint slot regardless of whether it later runs, fails, is denied,
+    is abandoned, or reaches an unknown state.
     """
     with task_lock(record["key"]):
         current = load_journal(record["key"]) or record
@@ -1575,10 +1673,8 @@ def _release_registration(state: dict[str, Any], record: dict[str, Any], reason:
             freed = True
         else:
             freed = False
-    chain = state.get("active_chain")
-    if freed and isinstance(chain, dict) and int(current.get("window", -1)) == int(chain.get("window", 0)):
-        chain["window_task_count"] = max(0, int(chain.get("window_task_count", 0)) - 1)
-        chain["total_task_count"] = max(0, int(chain.get("total_task_count", 0)) - 1)
+    # A registration is already a history item. Never refund its checkpoint
+    # position merely because execution did not dispatch.
     _project_recent_task(state, current)
     _mark_plan_item_from_record(state, current, "skipped")
     _upsert_outputs(state, current, "failed")
@@ -1604,9 +1700,15 @@ def _act_abandon_task(state: dict[str, Any], payload: dict[str, Any]) -> dict[st
         chain = state.get("active_chain")
         window_limit = int((chain or {}).get("window_limit", state.get("checkpoint_size", 12)))
         if isinstance(chain, dict) and int(chain.get("window_task_count", 0)) >= window_limit:
-            state["phase"] = "checkpoint"
-        else:
-            state["phase"] = "awaiting_assistant"
+            chain["window"] = int(chain.get("window", 0)) + 1
+            chain["window_task_count"] = 0
+            chain["window_limit"] = int(state.get("checkpoint_size", 12))
+            chain["checkpoint_resize_pending"] = False
+            evict_superseded_chain_leases(
+                chain.get("approval_scope_id") or chain.get("chain_id"),
+                int(chain["window"]),
+            )
+        state["phase"] = "awaiting_assistant"
     return {"abandoned": released.get("execution_status")}
 
 
@@ -1615,7 +1717,9 @@ CONVERSATION_ACTIONS.update({
     "abandon_task": _act_abandon_task,
     "task_execution_status": _act_task_execution_status,
     "task_delivery_status": _act_task_delivery_status,
+    "observe_submission": _act_observe_submission,
     "acknowledge_submission": _act_acknowledge_submission,
+    "acknowledge_unknown": _act_acknowledge_unknown,
 })
 
 
@@ -2401,11 +2505,12 @@ def chain_lease_covers(
     classification: str,
     cfg: dict[str, Any],
 ) -> bool:
-    """"Allow this chain" means the current checkpoint window and nothing wider.
+    """Checkpoint approval covers the current checkpoint window and nothing wider.
 
-    window_id is derived by the daemon as chain_id + ".w" + window and is never
-    accepted from the browser, so advancing a checkpoint necessarily creates a
-    fresh approval scope and a new human turn necessarily abandons the old one.
+    window_id is derived by the daemon from a conversation checkpoint scope plus
+    its window number and is never accepted from the browser. Human follow-up
+    turns keep that scope; advancing the checkpoint necessarily creates a fresh
+    approval window.
     """
     if not conversation_id or not window_id:
         return False
@@ -2753,7 +2858,11 @@ def normalize_outputs(raw: Any) -> list[dict[str, Any]]:
 
 
 MAX_MUTATE_CALLS = 8
-SUPPORTED_LBP_TASK_VERSIONS = {"1.2", "1.3"}
+SUPPORTED_LBP_TASK_VERSIONS = {"1.2", "1.3", "1.3.1"}
+
+
+def has_v13_task_features(version: str) -> bool:
+    return version in {"1.3", "1.3.1"}
 
 
 def normalize_call(raw: Any, *, require_id: bool, operation_type: str = "MCP") -> dict[str, Any]:
@@ -2789,8 +2898,8 @@ def normalize_operation(op: Any, task_version: str = "1.2") -> dict[str, Any]:
         op_type = "mcp.list_tools"
     if op_type not in {"mcp.call", "mcp.list_tools", "mcp.observe", "mcp.mutate"}:
         raise ValueError("LBP supports mcp.call, mcp.list_tools, mcp.observe and mcp.mutate")
-    if op_type == "mcp.mutate" and task_version != "1.3":
-        raise ValueError("mcp.mutate requires LBP 1.3")
+    if op_type == "mcp.mutate" and not has_v13_task_features(task_version):
+        raise ValueError("mcp.mutate requires LBP 1.3 or 1.3.1")
     if "mutating" in op or "required" in op or "classification" in op:
         raise ValueError("LBP derives classification and authority locally; remove mutating/required/classification")
     normalized: dict[str, Any] = {"type": op_type}
@@ -2870,8 +2979,8 @@ def normalize_task(raw: Any) -> dict[str, Any]:
         if value is not None:
             normalized[field] = value
     if "plan" in raw:
-        if task_version != "1.3":
-            raise ValueError("task.plan requires LBP 1.3")
+        if not has_v13_task_features(task_version):
+            raise ValueError("task.plan requires LBP 1.3 or 1.3.1")
         normalized["plan"] = normalize_plan(raw.get("plan"))
     for field in ("plan_id", "plan_item_id"):
         if field in raw:
@@ -2885,8 +2994,8 @@ def normalize_task(raw: Any) -> dict[str, Any]:
             raise ValueError("task.plan_revision must be >= 1")
         normalized["plan_revision"] = plan_revision
     if "outputs" in raw:
-        if task_version != "1.3":
-            raise ValueError("task.outputs requires LBP 1.3")
+        if not has_v13_task_features(task_version):
+            raise ValueError("task.outputs requires LBP 1.3 or 1.3.1")
         normalized["outputs"] = normalize_outputs(raw.get("outputs"))
     return normalized
 
@@ -2926,26 +3035,6 @@ def preflight_call(
         raise ValueError(f"tool_policy_denied: {server}.{tool_name} is not in allowed_tools")
     arguments = call.get("arguments", {})
     classification, verification = effective_classification(tool, tool_name, arguments, cfg)
-    if classification in {"write", "destructive"}:
-        # Root containment inspects path-shaped ARGUMENTS. It cannot read inside a
-        # free-form payload, and for a patch-shaped tool the payload header is
-        # exactly where the write target lives -- so for these tools `roots`
-        # constrains nothing at all.
-        #
-        # Rather than pretend otherwise, such a tool is ineligible for write
-        # authority unless the operator has explicitly acknowledged it by listing
-        # it in freeform_write_tools for this server.
-        freeform = sorted({
-            key for key in arguments
-            if isinstance(key, str) and is_freeform_text_key(key)
-        })
-        if freeform and tool_name not in set(cfg.get("freeform_write_tools", [])):
-            raise ValueError(
-                f"freeform_policy_denied: {server}.{tool_name} carries free-form payload "
-                f"field(s) {', '.join(freeform)} that configured roots cannot constrain. "
-                f"Add {tool_name!r} to this server's freeform_write_tools to accept that "
-                "explicitly, or use a tool with explicit path arguments."
-            )
     if classification == "write" and not cfg.get("write", False):
         raise ValueError(f"write_policy_denied: {server}.{tool_name} is write; enable writes for this server")
     if classification == "destructive":
@@ -3243,7 +3332,10 @@ def execute_task(task: dict[str, Any], preview: dict[str, Any]) -> dict[str, Any
     operation_result["duration_ms"] = int((time.time() - started) * 1000)
     return {
         "protocol": "lbp",
-        "version": task.get("version", LBP_VERSION),
+        # Result transport remains the legacy 1.3 shape until 1.3.1 body/file
+        # delivery is implemented end-to-end. A 1.3.1 task has 1.3 semantics,
+        # but must not cause a legacy-shaped result to be mislabeled 1.3.1.
+        "version": LBP_VERSION,
         "bridge_version": VERSION,
         "task_id": task["id"],
         "title": task.get("title"),
@@ -3319,8 +3411,10 @@ def conversation_execution_context(conversation_id: str, registration_id: Any) -
     if int(record.get("window", -1)) != int(chain.get("window", 0)):
         raise ValueError("stale_task: task belongs to a superseded checkpoint window")
 
-    # Derived here, never accepted from the browser.
-    window_id = f"{chain.get('chain_id')}.w{int(chain.get('window', 0))}"
+    # Derived here, never accepted from the browser. Approval/checkpoint scope
+    # survives human follow-up turns even though chain_id intentionally does not.
+    approval_scope_id = chain.get("approval_scope_id") or chain.get("chain_id")
+    window_id = f"{approval_scope_id}.w{int(chain.get('window', 0))}"
     return record, window_id
 
 
@@ -3445,7 +3539,7 @@ def valid_host(host_header: str | None) -> bool:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "LocalMcpBridge/0.9.2"
+    server_version = "LocalMcpBridge/0.9.2.2"
 
     def log_message(self, fmt: str, *args: Any) -> None:
         print(f"[{self.log_date_time_string()}] {fmt % args}")
@@ -3632,6 +3726,31 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"ok": True, "recovered": key})
         except Exception as exc:
             self._send(400, {"ok": False, "error": str(exc)})
+
+def _debug_state(event: str, state: dict, **extra):
+    chain = state.get("active_chain") or {}
+    print(
+        "[LBP daemon]",
+        event,
+        {
+            "conversation_id": state.get("conversation_id"),
+            "revision": state.get("revision"),
+            "phase": state.get("phase"),
+            "enabled": state.get("enabled"),
+            "workflow_attached": state.get("workflow_attached"),
+            "pending_human_send": state.get("pending_human_send"),
+            "last_user_turn_id": state.get("last_user_turn_id"),
+            "last_assistant_turn_id": state.get("last_assistant_turn_id"),
+            "current_task_id": state.get("current_task_id"),
+            "current_registration": state.get("current_registration"),
+            "chain_id": chain.get("chain_id"),
+            "window": chain.get("window"),
+            "window_task_count": chain.get("window_task_count"),
+            "total_task_count": chain.get("total_task_count"),
+            **extra,
+        },
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

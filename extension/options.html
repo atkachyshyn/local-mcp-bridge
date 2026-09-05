@@ -26,7 +26,14 @@
             <option value="auto_continue">Auto-continue · submit local results as the next user turn</option>
           </select>
         </label>
-        <label><span>Checkpoint interval</span><div class="with-suffix"><input id="interaction-max-rounds" type="number" min="1" max="50" value="12"><span>steps</span></div><small>At each checkpoint the bridge pauses locally before posting the next result. Continue to the next checkpoint or stop the chain.</small></label>
+        <label><span>Checkpoint size</span><div class="with-suffix"><input id="interaction-max-rounds" type="number" min="1" max="100" value="12"><span>tasks</span></div><small>The task window rolls automatically at this boundary. The global task sequence does not reset, and failed, denied, abandoned, or unknown tasks still consume one slot.</small></label>
+        <label class="wide"><span>Unknown mutation recovery</span>
+          <select id="interaction-unknown-recovery">
+            <option value="manual">Manual · stop until I acknowledge the ambiguity</option>
+            <option value="auto_continue">Auto-continue · acknowledge after the result is provider-confirmed</option>
+          </select>
+          <small>Auto-continue never retries the unknown mutation or marks it successful. The unknown result stays in history and the chain resumes only after the provider has accepted the result turn.</small>
+        </label>
       </div>
       <p class="interaction-note">Recommended: Auto-continue + right-side Progress sidebar. LBP task and result blocks remain visible in chat exactly as ChatGPT renders them. Daemon policy still decides tools, roots, VERIFY, writes, destructive operations, and approvals.</p>
     </section>
@@ -77,7 +84,7 @@
           </select>
           <small>This only controls the broadest temporary scope the popup may offer. Approval until the next user message lasts for the current genuine-user-request chain; the automatic checkpoint does not reset it. It never weakens the baseline policy, and the destructive hard gate remains independent.</small>
         </label>
-        <label class="wide"><span>Free-form payload write tools · one name per line</span><textarea class="server-freeform-write" rows="3" placeholder="apply_patch"></textarea><small>Allowed roots inspect path-shaped <em>arguments</em>. They cannot look inside a free-form payload field (<code>patch</code>, <code>content</code>, <code>old</code>, <code>new</code>, <code>text</code>, <code>replacement</code>, <code>pattern</code>, <code>query</code>) &mdash; and for a patch-style tool that payload is where the write target lives, so roots constrain it not at all. Listing a tool here is an explicit acknowledgement of that. Leave empty to deny.</small></label>
+
         <label class="toggle wide"><input class="server-destructive-approval" type="checkbox" checked> Always ask before destructive operations</label>
       </div>
       <div class="risk-warning" hidden></div>

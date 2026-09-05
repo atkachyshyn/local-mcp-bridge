@@ -9,7 +9,11 @@ globalThis.LBP = (() => {
   const RESULT_ENVELOPE = { start: "<LBP_RESULT>", end: "</LBP_RESULT>" };
   const MAX_OBSERVE_CALLS = 8;
   const MAX_MUTATE_CALLS = 8;
-  const SUPPORTED_TASK_VERSIONS = new Set(["1.2", "1.3"]);
+  const SUPPORTED_TASK_VERSIONS = new Set(["1.2", "1.3", "1.3.1"]);
+
+  function hasV13TaskFeatures(version) {
+    return version === "1.3" || version === "1.3.1";
+  }
 
   function normalizeCall(raw, requireId = false, operationType = "MCP") {
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
@@ -47,8 +51,8 @@ globalThis.LBP = (() => {
     if (!["mcp.call", "mcp.list_tools", "mcp.observe", "mcp.mutate"].includes(op.type)) {
       throw new Error("LBP supports mcp.call, mcp.list_tools, mcp.observe and mcp.mutate");
     }
-    if (op.type === "mcp.mutate" && version !== "1.3") {
-      throw new Error("mcp.mutate requires LBP 1.3");
+    if (op.type === "mcp.mutate" && !hasV13TaskFeatures(version)) {
+      throw new Error("mcp.mutate requires LBP 1.3 or 1.3.1");
     }
     if (typeof op.server !== "string" || !op.server) throw new Error(`${op.type}.server is required`);
     if (op.type === "mcp.list_tools") {
@@ -174,7 +178,7 @@ globalThis.LBP = (() => {
     if (raw.protocol && raw.protocol !== "lbp") throw new Error("task.protocol must be 'lbp'");
     const version = raw.version === undefined || raw.version === null ? "1.2" : String(raw.version);
     if (!SUPPORTED_TASK_VERSIONS.has(version)) {
-      throw new Error(`task.version must be '1.2' or '1.3'; LBP 1.1 is historical and is not a runtime target (got ${version})`);
+      throw new Error(`task.version must be '1.2', '1.3', or '1.3.1'; LBP 1.1 is historical and is not a runtime target (got ${version})`);
     }
 
     let operation = raw.operation;
@@ -201,7 +205,7 @@ globalThis.LBP = (() => {
     }
     if (typeof task.id !== "string" || !task.id.trim()) throw new Error("task.id is required");
     if (raw.plan !== undefined) {
-      if (version !== "1.3") throw new Error("task.plan requires LBP 1.3");
+      if (!hasV13TaskFeatures(version)) throw new Error("task.plan requires LBP 1.3 or 1.3.1");
       task.plan = normalizePlan(raw.plan);
     }
     if (raw.plan_id !== undefined) task.plan_id = metadataId(raw.plan_id, "task.plan_id");
@@ -212,7 +216,7 @@ globalThis.LBP = (() => {
       task.plan_revision = revision;
     }
     if (raw.outputs !== undefined) {
-      if (version !== "1.3") throw new Error("task.outputs requires LBP 1.3");
+      if (!hasV13TaskFeatures(version)) throw new Error("task.outputs requires LBP 1.3 or 1.3.1");
       task.outputs = normalizeOutputs(raw.outputs);
     }
     return task;
@@ -287,8 +291,52 @@ globalThis.LBP = (() => {
 
   const RESULT_STATUSES = new Set(["ok", "error", "unknown"]);
 
+  function isJsonObject(value) {
+    return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+  }
+
+  function validateV131ResultBody(body) {
+    if (!isJsonObject(body)) {
+      throw new Error("LBP 1.3.1 result body must be a JSON object");
+    }
+
+    if (body.type === "inline") {
+      if (!isJsonObject(body.content)) {
+        throw new Error("LBP 1.3.1 inline result body.content must be a JSON object");
+      }
+      if (!isJsonObject(body.content.operation)) {
+        throw new Error("LBP 1.3.1 inline result content.operation must be a JSON object");
+      }
+      if (!Array.isArray(body.content.applied_mutations)) {
+        throw new Error("LBP 1.3.1 inline result content.applied_mutations must be an array");
+      }
+      if (!Array.isArray(body.content.outputs)) {
+        throw new Error("LBP 1.3.1 inline result content.outputs must be an array");
+      }
+      return body;
+    }
+
+    if (body.type === "file") {
+      if (typeof body.name !== "string" || !body.name.trim()) {
+        throw new Error("LBP 1.3.1 file result body.name is required");
+      }
+      if (body.media_type !== "application/json") {
+        throw new Error("LBP 1.3.1 file result body.media_type must be 'application/json'");
+      }
+      if (!Number.isInteger(body.bytes) || body.bytes < 0) {
+        throw new Error("LBP 1.3.1 file result body.bytes must be an integer >= 0");
+      }
+      if (typeof body.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(body.sha256)) {
+        throw new Error("LBP 1.3.1 file result body.sha256 must be 64 lowercase hex characters");
+      }
+      return body;
+    }
+
+    throw new Error("LBP 1.3.1 result body.type must be 'inline' or 'file'");
+  }
+
   function validateResultShape(value) {
-    if (!value || typeof value !== "object" || Array.isArray(value)) {
+    if (!isJsonObject(value)) {
       throw new Error("LBP result must be a JSON object");
     }
     if (value.protocol !== "lbp") throw new Error("LBP result protocol must be 'lbp'");
@@ -298,7 +346,14 @@ globalThis.LBP = (() => {
     if (!RESULT_STATUSES.has(value.status)) {
       throw new Error(`LBP result status must be one of ${[...RESULT_STATUSES].join(", ")}`);
     }
-    if (!value.operation || typeof value.operation !== "object" || Array.isArray(value.operation)) {
+
+    if (String(value.version || "") === "1.3.1") {
+      validateV131ResultBody(value.body);
+      return value;
+    }
+
+    // Legacy LBP 1.2/1.3 result shape remains unchanged.
+    if (!isJsonObject(value.operation)) {
       throw new Error("LBP result operation must be a JSON object");
     }
     return value;

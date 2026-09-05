@@ -18,6 +18,7 @@ globalThis.LBP_COORDINATOR = (() => {
   const DEFAULT_INTERACTION = Object.freeze({
     mode: "manual",
     max_round_trips: 12,
+    unknown_recovery: "manual",
     status_surface: "panel"
   });
 
@@ -41,9 +42,19 @@ globalThis.LBP_COORDINATOR = (() => {
   let listeners = new Set();
   let ownerGranted = false;
 
+  const MAX_INLINE_RESULT_BYTES = 48 * 1024;
+  const MAX_CACHED_INLINE_RESULTS = 8;
+
   // Per-task UI state that is presentation only. Never used for any execution
-  // decision -- those all read daemon state.
+  // decision -- those all read daemon state. Never put complete MCP result
+  // bodies in taskView.
   const taskView = new Map();
+
+  // Ephemeral, non-reactive cache used only for small results that still
+  // need to be inserted/submitted to the provider. The daemon journal
+  // remains authoritative.
+  const resultCache = new Map();
+
   const observedUserTurns = new Set();
   const settledAssistantTurns = new Set();
   const handledAssistantTasks = new Set();
@@ -67,8 +78,86 @@ globalThis.LBP_COORDINATOR = (() => {
 
   function setTaskView(taskId, patch) {
     if (!taskId) return;
-    taskView.set(taskId, { ...(taskView.get(taskId) || {}), ...patch });
+    // taskView is presentation state only. Never allow raw MCP result bodies
+    // to enter reactive UI state, even if a caller accidentally passes one.
+    const safePatch = { ...(patch || {}) };
+    delete safePatch.result;
+    taskView.set(taskId, { ...(taskView.get(taskId) || {}), ...safePatch });
     notify();
+  }
+
+  function resultSizeBytes(result) {
+    const serialized = JSON.stringify(result);
+    if (typeof serialized !== "string") {
+      throw new Error("LBP result could not be serialized");
+    }
+    return new TextEncoder().encode(serialized).byteLength;
+  }
+
+  function cacheInlineResult(taskId, result, bytes = null) {
+    if (!taskId) return false;
+    const size = Number.isFinite(bytes) ? bytes : resultSizeBytes(result);
+    if (size > MAX_INLINE_RESULT_BYTES) {
+      resultCache.delete(taskId);
+      return false;
+    }
+    // Refresh insertion order when replacing an existing entry.
+    resultCache.delete(taskId);
+    resultCache.set(taskId, result);
+    while (resultCache.size > MAX_CACHED_INLINE_RESULTS) {
+      const oldest = resultCache.keys().next().value;
+      if (oldest === undefined) break;
+      resultCache.delete(oldest);
+    }
+    return true;
+  }
+
+  function formatResultBytes(bytes) {
+    if (!Number.isFinite(bytes)) return "unknown size";
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+  }
+
+  async function withholdOversizedResult(registration, resultBytes) {
+    const taskId = registration?.task_id;
+    const registrationId = registration?.registration_id;
+
+    if (taskId) {
+      resultCache.delete(taskId);
+      setTaskView(taskId, { resultBytes, delivery: "oversized" });
+    }
+
+    // Execution already happened successfully. Failure to record delivery
+    // metadata must never turn this into an execution failure.
+    if (registrationId) {
+      const pending = taskId ? currentPendingRegistrationFor({ task_id: taskId }) : null;
+      if (pending?.deliveryStatus !== "withheld") {
+        try {
+          await stateCall("task_delivery_status", { registration: registrationId, status: "withheld" });
+        } catch (error) {
+          logTransport("oversized_delivery_status_failed", {
+            task_id: taskId,
+            registration_id: registrationId,
+            error: String(error?.stack || error?.message || error)
+          });
+        }
+      }
+    }
+
+    logTransport("result_oversized", {
+      task_id: taskId,
+      registration_id: registrationId,
+      result_bytes: resultBytes,
+      inline_limit_bytes: MAX_INLINE_RESULT_BYTES
+    });
+
+    setStatus(
+      "paused",
+      "LBP ⏸ Result too large for inline delivery",
+      `${taskId} · ${formatResultBytes(resultBytes)} · inline limit ${formatResultBytes(MAX_INLINE_RESULT_BYTES)}. ` +
+        "The complete result remains in the daemon journal."
+    );
   }
 
   function setInteraction(next) {
@@ -186,7 +275,8 @@ globalThis.LBP_COORDINATOR = (() => {
     return stateCall("configure", {
       mode: next.mode === "auto_continue" ? "auto_continue" : "manual",
       checkpoint_size: Number.isFinite(checkpoint) && checkpoint >= 1
-        ? Math.floor(checkpoint) : DEFAULT_INTERACTION.max_round_trips
+        ? Math.floor(checkpoint) : DEFAULT_INTERACTION.max_round_trips,
+      unknown_recovery: next.unknown_recovery === "auto_continue" ? "auto_continue" : "manual"
     });
   }
 
@@ -216,18 +306,24 @@ globalThis.LBP_COORDINATOR = (() => {
     // human chain and reset checkpoint progress.
     const pending = currentPendingRegistrationFor();
     if (!pending?.registrationId || !pending?.deliveryId) return false;
+    // Result content is deliberately not required here. Correlation uses
+    // daemon-owned task/delivery metadata, not the cached result body.
     const delivery = deliveryFrom(
       { registration_id: pending.registrationId, task_id: pending.taskId },
-      taskView.get(pending.taskId)?.result || null,
+      null,
       pending
     );
-    for (const turn of turns.user || []) {
-      if (!turn.id || sameTurnId(turn.id, daemonState?.last_user_turn_id)) continue;
-      if (!api.textContainsDelivery(api.sourceText(turn.host), delivery)) continue;
+    if (pending.deliveryStatus === "observed" && pending.observedTurnId) {
+      const all = turns.all || [];
+      const observedIndex = all.findIndex((turn) => turn.role === "user" && sameTurnId(turn.id, pending.observedTurnId));
+      const confirmingAssistant = observedIndex >= 0
+        ? all.slice(observedIndex + 1).find((turn) => turn.role === "assistant" && turn.id)
+        : null;
+      if (!confirmingAssistant) return false;
       try {
         await stateCall("acknowledge_submission", {
           registration: pending.registrationId,
-          turn_id: turn.id,
+          turn_id: pending.observedTurnId,
           delivery_id: delivery.delivery_id,
           result_digest: delivery.result_digest
         });
@@ -238,19 +334,64 @@ globalThis.LBP_COORDINATOR = (() => {
           resultDigest: delivery.result_digest,
           delivery: "submitted"
         });
-        observedUserTurns.add(turn.id);
+        resultCache.delete(pending.taskId);
         logTransport("result_acknowledged", {
           task_id: pending.taskId,
           registration_id: pending.registrationId,
+          turn_id: pending.observedTurnId,
+          delivery_id: delivery.delivery_id,
+          confirming_assistant_turn_id: confirmingAssistant.id
+        });
+        if (
+          pending.executionStatus === "unknown" &&
+          daemonState?.unknown_recovery === "auto_continue" &&
+          daemonState?.phase === "stopped" &&
+          daemonState?.stopped_reason === "unknown_mutation_state"
+        ) {
+          await stateCall("acknowledge_unknown", { registration: pending.registrationId });
+          setTaskView(pending.taskId, {
+            status: "unknown",
+            detail: "Ambiguous result acknowledged automatically"
+          });
+          logTransport("unknown_acknowledge_auto_success", {
+            task_id: pending.taskId,
+            registration_id: pending.registrationId
+          });
+        }
+        return true;
+      } catch (error) {
+        setStatus("paused", "LBP ⏸ Result confirmation failed", String(error.message || error));
+        return false;
+      }
+    }
+
+    for (const turn of turns.user || []) {
+      if (!turn.id || sameTurnId(turn.id, daemonState?.last_user_turn_id)) continue;
+      if (!api.textContainsDelivery(api.sourceText(turn.host), delivery)) continue;
+      try {
+        await stateCall("observe_submission", {
+          registration: pending.registrationId,
           turn_id: turn.id,
           delivery_id: delivery.delivery_id,
-          recovery: "delivery_marker"
+          result_digest: delivery.result_digest
+        });
+        setTaskView(pending.taskId, {
+          taskId: pending.taskId,
+          registrationId: pending.registrationId,
+          deliveryId: delivery.delivery_id,
+          resultDigest: delivery.result_digest,
+          delivery: "observed"
+        });
+        observedUserTurns.add(turn.id);
+        logTransport("result_user_turn_observed", {
+          task_id: pending.taskId,
+          registration_id: pending.registrationId,
+          turn_id: turn.id,
+          delivery_id: delivery.delivery_id
         });
         return true;
       } catch (error) {
-        // Keep normal reconciliation fail-closed. A mismatched delivery marker
-        // must never be promoted to delivered just because a new turn exists.
-        setStatus("paused", "LBP ⏸ Result acknowledgement failed", String(error.message || error));
+        setStatus("paused", "LBP ⏸ Result observation failed", String(error.message || error));
         return false;
       }
     }
@@ -262,7 +403,7 @@ globalThis.LBP_COORDINATOR = (() => {
     const tasks = Array.isArray(daemonState?.recent_tasks) ? daemonState.recent_tasks : [];
     const candidates = tasks
       .filter((task) => task?.registration_id && task.delivery_status !== "submitted")
-      .filter((task) => ["completed", "error"].includes(task.execution_status));
+      .filter((task) => ["completed", "error", "unknown"].includes(task.execution_status));
     const task = result
       ? (candidates.find((item) => item.registration_id === current && item.task_id === result.task_id)
         || candidates.find((item) => item.task_id === result.task_id))
@@ -274,7 +415,8 @@ globalThis.LBP_COORDINATOR = (() => {
       executionStatus: task.execution_status,
       deliveryStatus: task.delivery_status,
       deliveryId: task.delivery_id || task.deliveryId || null,
-      resultDigest: task.result_digest || task.resultDigest || null
+      resultDigest: task.result_digest || task.resultDigest || null,
+      observedTurnId: task.observed_turn_id || task.observedTurnId || null
     };
   }
 
@@ -297,48 +439,107 @@ globalThis.LBP_COORDINATOR = (() => {
       // a chain, so virtualization cannot resurrect a historical chain.
       await stateCall("observe_user_turn", { turn_id: observedUser.id });
       observedUserTurns.add(observedUser.id);
-      if (!daemonState?.pending_human_send) pendingHumanTurnBaseline = null;
     }
   }
 
   function assistantCandidates(turns) {
     const assistantIdsAtSend = pendingHumanTurnBaseline?.assistantIds;
+
     return (turns.assistant || []).filter((turn) => {
-      if (!turn.id) return false;
-      if (settledAssistantTurns.has(turn.id)) return false;
-      if (assistantIdsAtSend && assistantIdsAtSend.has(turn.id)) return false;
+      if (!turn.id) {
+        logTransport("assistant_skipped", {
+          reason: "missing_turn_id"
+        });
+        return false;
+      }
+
+      if (settledAssistantTurns.has(turn.id)) {
+        logTransport("assistant_skipped", {
+          turn_id: turn.id,
+          reason: "already_settled"
+        });
+        return false;
+      }
+
+      if (assistantIdsAtSend?.has(turn.id)) {
+        logTransport("assistant_skipped", {
+          turn_id: turn.id,
+          reason: "present_in_send_baseline"
+        });
+        return false;
+      }
+
+      logTransport("assistant_candidate", {
+        turn_id: turn.id
+      });
+
       return true;
     });
   }
 
   async function handleAssistantTurn(turn) {
+    logTransport("assistant_seen", {
+      turn_id: turn?.id,
+      generating: adapter().isGenerating()
+    });
+
     const api = adapter();
+
     if (!turn) return;
-    if (api.isGenerating()) return;
+
+    if (api.isGenerating()) {
+      logTransport("assistant_waiting_for_settle", {
+        turn_id: turn.id
+      });
+      return;
+    }
+
     if (!settledAssistantTurns.has(turn.id)) {
       settledAssistantTurns.add(turn.id);
-      logTransport("assistant_turn_settled", { turn_id: turn.id });
+
+      logTransport("assistant_turn_settled", {
+        turn_id: turn.id
+      });
     }
+
     if (!sameTurnId(turn.id, daemonState?.last_assistant_turn_id)) {
-      await stateCall("observe_assistant_turn", { turn_id: turn.id });
+      await stateCall("observe_assistant_turn", {
+        turn_id: turn.id
+      });
     }
 
     const taskState = api.assistantTaskState(turn.host);
 
     if (taskState.kind === "none") {
-      if (daemonState?.phase === "awaiting_assistant") await stateCall("assistant_no_task");
-      pendingHumanTurnBaseline = null;
+      // One logical assistant response may surface as multiple provider turns.
+      // Prose-only segments are therefore not evidence that the active LBP
+      // chain has ended: a later physical assistant turn may carry the task.
+      // Keep the send baseline as well, so historical assistant turns remain
+      // excluded while we wait for that task-bearing turn.
+      logTransport("assistant_no_task_ignored", {
+        turn_id: turn.id,
+        phase: daemonState?.phase
+      });
       return;
     }
+
     if (taskState.kind === "multiple") {
-      await stateCall("stop", { reason: "multiple_tasks_in_one_assistant_turn" });
-      setStatus("error", "LBP ⚠ Multiple tasks in one reply",
-        `${taskState.count} LBP tasks in a single assistant message; exactly one is allowed.`);
+      setStatus(
+        "paused",
+        "LBP ⚠ Multiple tasks in one reply",
+        `${taskState.count} LBP tasks found; exactly one is allowed.`
+      );
+
       return;
     }
+
     if (taskState.kind === "malformed") {
-      await stateCall("stop", { reason: "malformed_task" });
-      setStatus("error", "LBP ⚠ Malformed task", String(taskState.error || ""));
+      setStatus(
+        "paused",
+        "LBP ⚠ Malformed task",
+        String(taskState.error || "")
+      );
+
       return;
     }
 
@@ -348,27 +549,74 @@ globalThis.LBP_COORDINATOR = (() => {
       plan_id: taskState.task.plan_id || taskState.task.plan?.id || null,
       plan_item_id: taskState.task.plan_item_id || null
     });
-    const taskKey = `${turn.id}\n${taskState.fingerprint || globalThis.LBP.canonicalJson(taskState.task)}`;
-    if (handledAssistantTasks.has(taskKey)) return;
-    // `enabled` only decides whether the model gets the instructions. What
-    // authorises a run is an active chain, which needs an armed human send.
-    if (["stopped", "disabled", "checkpoint"].includes(daemonState?.phase)) return;
+
+    const taskKey =
+      `${turn.id}\n${taskState.fingerprint || globalThis.LBP.canonicalJson(taskState.task)}`;
+
+    if (handledAssistantTasks.has(taskKey)) {
+      return;
+    }
+
+    if (
+      ["stopped", "disabled"].includes(
+        daemonState?.phase
+      )
+    ) {
+      return;
+    }
 
     let registration;
+
     try {
-      // Registration is idempotent on (assistant turn, digest), so a reload that
-      // rediscovers its own task re-attaches instead of being refused.
+      logTransport("task_register_attempt", {
+        turn_id: turn.id,
+        task_id: taskState.task.id,
+        phase: daemonState?.phase,
+        last_assistant_turn_id: daemonState?.last_assistant_turn_id
+      });
+
       const state = await stateCall("register_task", {
         assistant_turn_id: turn.id,
         task: taskState.task
       });
-      registration = state.task;
+
+      /*
+      * IMPORTANT:
+      * stateCall("register_task") returns the updated daemon
+      * conversation state. The actual task registration is state.task.
+      *
+      * Assign it BEFORE trying to log registration fields.
+      */
+      registration = state?.task;
+
+      if (
+        !registration?.registration_id ||
+        !registration?.task_id
+      ) {
+        throw new Error(
+          "register_task returned no task registration"
+        );
+      }
+
+      logTransport("task_register_success", {
+        turn_id: turn.id,
+        task_id: registration.task_id,
+        registration_id: registration.registration_id,
+        execution_status: registration.execution_status
+      });
+
+      /*
+      * Only mark this assistant task handled after we have a
+      * valid registration object from the daemon.
+      */
       handledAssistantTasks.add(taskKey);
+
       logTransport("task_registered", {
         task_id: registration.task_id,
         registration_id: registration.registration_id,
         status: registration.execution_status
       });
+
       setTaskView(taskState.task.id, {
         taskId: taskState.task.id,
         title: taskState.task.title || taskState.task.id,
@@ -377,15 +625,33 @@ globalThis.LBP_COORDINATOR = (() => {
         status: registration.execution_status
       });
     } catch (error) {
-      const message = String(error.message || error);
-      if (message.includes("checkpoint_required")) {
-        setStatus("paused", "LBP ⏸ Checkpoint reached", "Continue to start a new approval window.");
-        return;
-      }
-      // A refusal here is the daemon rejecting stale or out-of-phase work. That
-      // is the barrier doing its job, not something to work around.
-      handledAssistantTasks.add(taskKey);
-      setStatus("paused", "LBP ⏸ Task not registered", message);
+      logTransport("task_register_failed", {
+        turn_id: turn.id,
+        task_id: taskState.task.id,
+        error: String(
+          error?.stack ||
+          error?.message ||
+          error
+        ),
+        phase: daemonState?.phase
+      });
+
+      const message = String(
+        error?.message || error
+      );
+
+      /*
+      * Do NOT mark taskKey handled here.
+      *
+      * An unexpected coordinator/runtime failure after the daemon
+      * accepted registration must remain recoverable.
+      */
+      setStatus(
+        "paused",
+        "LBP ⏸ Task registration pipeline failed",
+        message
+      );
+
       return;
     }
 
@@ -396,7 +662,7 @@ globalThis.LBP_COORDINATOR = (() => {
 
   async function handleAssistantTurns(turns) {
     for (const turn of assistantCandidates(turns)) {
-      if (["stopped", "disabled", "checkpoint"].includes(daemonState?.phase)) return;
+      if (["stopped", "disabled"].includes(daemonState?.phase)) return;
       await handleAssistantTurn(turn);
       if (daemonState?.phase !== "awaiting_assistant" && daemonState?.phase !== "task_registered") return;
     }
@@ -450,6 +716,10 @@ globalThis.LBP_COORDINATOR = (() => {
       });
       if (!response?.ok) throw new Error(response?.error || "local task failed");
       const result = response.payload.result;
+
+      // Measure before the result is put into any presentation state or
+      // provider composer path.
+      const resultBytes = resultSizeBytes(result);
       const delivery = deliveryFrom(registration, result, response.payload);
 
       // Execution status and delivery status are separate facts. This records
@@ -460,15 +730,28 @@ globalThis.LBP_COORDINATOR = (() => {
       await stateCall("task_execution_status", { registration: registrationId, status: executionStatus });
       const pending = currentPendingRegistrationFor({ task_id: taskId });
       const boundDelivery = deliveryFrom(registration, result, pending || delivery);
+      // Metadata only. Do NOT put `result` into taskView -- see setTaskView.
       setTaskView(taskId, {
         status: executionStatus,
-        result,
         deliveryId: boundDelivery.delivery_id,
-        resultDigest: boundDelivery.result_digest
+        resultDigest: boundDelivery.result_digest,
+        resultBytes
       });
-      logTransport("result_ready", { task_id: taskId, registration_id: registrationId, status: result.status });
+      logTransport("result_ready", {
+        task_id: taskId, registration_id: registrationId, status: result.status, result_bytes: resultBytes
+      });
 
-      await deliverResult(registration, result, boundDelivery);
+      // Hard browser safety boundary. Large results never reach presentation
+      // or the ChatGPT composer.
+      if (resultBytes > MAX_INLINE_RESULT_BYTES) {
+        await withholdOversizedResult(registration, resultBytes);
+        return;
+      }
+
+      // Only small results may be retained transiently in browser memory.
+      cacheInlineResult(taskId, result, resultBytes);
+
+      await deliverResult(registration, result, { ...boundDelivery, resultBytes });
     } catch (error) {
       setTaskView(taskId, { status: "error", detail: String(error.message || error) });
       setStatus("error", "LBP ⚠ Task failed", String(error.message || error));
@@ -484,6 +767,22 @@ globalThis.LBP_COORDINATOR = (() => {
     const api = adapter();
     const taskId = registration.task_id;
     const registrationId = registration.registration_id;
+
+    const resultBytes = Number.isFinite(deliveryMeta?.resultBytes)
+      ? deliveryMeta.resultBytes
+      : Number.isFinite(deliveryMeta?.result_bytes)
+        ? deliveryMeta.result_bytes
+        : resultSizeBytes(result);
+
+    // Defense in depth. No caller may bypass the inline transport ceiling,
+    // even on a recovery/re-delivery path that reaches this function directly.
+    if (resultBytes > MAX_INLINE_RESULT_BYTES) {
+      await withholdOversizedResult(registration, resultBytes);
+      return;
+    }
+
+    cacheInlineResult(taskId, result, resultBytes);
+
     const delivery = deliveryFrom(registration, result, deliveryMeta);
     if (deliveringRegistrations.has(registrationId)) return;
     deliveringRegistrations.add(registrationId);
@@ -506,12 +805,6 @@ globalThis.LBP_COORDINATOR = (() => {
 
       // A checkpoint result is inserted and left for the human. It is never
       // auto-submitted, and the window does not advance until it is.
-      if (daemonState?.phase === "checkpoint") {
-        setTaskView(taskId, { delivery: "awaiting_checkpoint" });
-        setStatus("paused", "LBP ⏸ Checkpoint",
-          `Result for ${taskId} is in the composer. Continue to open a new approval window.`);
-        return;
-      }
       if (!auto) {
         setStatus("connected", "LBP ● Result ready", `${taskId} · submit when ready.`);
         return;
@@ -540,26 +833,28 @@ globalThis.LBP_COORDINATOR = (() => {
       setStatus("paused", "LBP ⏸ Result not submitted", `${taskId}: ${submitted.reason}`);
       return;
     }
-    // Only now, with a real provider turn carrying the expected delivery marker, is
-    // delivery recorded and the checkpoint window allowed to advance.
-    await stateCall("acknowledge_submission", {
+    // A matching DOM user turn proves only that ChatGPT rendered the send locally.
+    // It is not persistence proof: the conversation write can still fail after
+    // optimistic rendering. Persist this intermediate observation and keep the
+    // journal result until a later assistant turn confirms provider acceptance.
+    await stateCall("observe_submission", {
       registration: registration.registration_id,
       turn_id: submitted.turnId,
       delivery_id: delivery.delivery_id,
       result_digest: delivery.result_digest
     });
-    logTransport("result_acknowledged", {
+    logTransport("result_submission_observed", {
       task_id: taskId,
       registration_id: registration.registration_id,
       turn_id: submitted.turnId,
       delivery_id: delivery.delivery_id
     });
     setTaskView(taskId, {
-      delivery: "submitted",
+      delivery: "observed",
       deliveryId: delivery.delivery_id,
       resultDigest: delivery.result_digest
     });
-    setStatus("continuing", "LBP ● Continuing", `${taskId} submitted as the next user turn.`);
+    setStatus("continuing", "LBP ● Awaiting provider confirmation", `${taskId} appeared as a user turn; waiting for the provider response.`);
     logTransport("next_assistant_wait", { task_id: taskId });
   }
 
@@ -568,37 +863,66 @@ globalThis.LBP_COORDINATOR = (() => {
       type: "lbp-run", registration: registrationId, approvalToken: null
     });
     if (!response?.ok) throw new Error(response?.error || "stored result replay failed");
+    const result = response.payload.result;
+    const resultBytes = resultSizeBytes(result);
     return {
-      result: response.payload.result,
+      result,
+      result_bytes: resultBytes,
+      resultBytes,
       delivery_id: response.payload.delivery_id || null,
       result_digest: response.payload.result_digest || null
     };
   }
 
   async function recoverPendingDelivery() {
-    if (!["result_ready", "checkpoint"].includes(daemonState?.phase)) return;
+    if (daemonState?.phase !== "result_ready") return;
     const pending = currentPendingRegistrationFor();
     if (!pending || deliveringRegistrations.has(pending.registrationId)) return;
 
-    const api = adapter();
-    let result = taskView.get(pending.taskId)?.result || null;
-    let deliveryMeta = pending;
-    if (!result) {
-      const replay = await fetchStoredDelivery(pending.registrationId);
-      result = replay.result;
-      deliveryMeta = replay;
+    // Withheld results wait for explicit human recovery. Observed results have
+    // already appeared as a user turn and must never be blindly re-delivered;
+    // they wait for reconcileSubmittedResultTurn() to see provider confirmation.
+    if (pending.deliveryStatus === "withheld" || pending.deliveryStatus === "observed") {
       setTaskView(pending.taskId, {
         taskId: pending.taskId,
         registrationId: pending.registrationId,
         status: pending.executionStatus,
-        result,
+        delivery: taskView.get(pending.taskId)?.delivery || pending.deliveryStatus,
+        deliveryId: pending.deliveryId,
+        resultDigest: pending.resultDigest
+      });
+      return;
+    }
+
+    const api = adapter();
+    let result = resultCache.get(pending.taskId) || null;
+    let deliveryMeta = pending;
+    if (!result) {
+      const replay = await fetchStoredDelivery(pending.registrationId);
+      const resultBytes = replay.resultBytes;
+      if (resultBytes > MAX_INLINE_RESULT_BYTES) {
+        await withholdOversizedResult(
+          { registration_id: pending.registrationId, task_id: pending.taskId },
+          resultBytes
+        );
+        return;
+      }
+      result = replay.result;
+      deliveryMeta = replay;
+      cacheInlineResult(pending.taskId, result, resultBytes);
+      setTaskView(pending.taskId, {
+        taskId: pending.taskId,
+        registrationId: pending.registrationId,
+        status: pending.executionStatus,
         deliveryId: replay.delivery_id,
-        resultDigest: replay.result_digest
+        resultDigest: replay.result_digest,
+        resultBytes
       });
       logTransport("result_ready", {
         task_id: pending.taskId,
         registration_id: pending.registrationId,
         status: result.status,
+        result_bytes: resultBytes,
         recovery: "journal_replay"
       });
     }
@@ -609,57 +933,37 @@ globalThis.LBP_COORDINATOR = (() => {
     };
     const delivery = deliveryFrom(registration, result, deliveryMeta);
     if (pending.deliveryStatus === "inserted" && api.composerHoldsDelivery(delivery)) {
-      if (daemonState?.mode === "auto_continue" && daemonState?.phase !== "checkpoint") {
+      if (daemonState?.mode === "auto_continue") {
         await submitResult(registration, result, delivery);
       }
       return;
     }
-    await deliverResult(registration, result, delivery);
+    await deliverResult(registration, result, deliveryMeta);
   }
 
   // --- Public actions -------------------------------------------------------------
 
   async function enable() {
+    const baseline = adapter().providerTurnIdSnapshot();
+
+    pendingHumanTurnBaseline = {
+      userIds: baseline.userIds,
+      assistantIds: baseline.assistantIds
+    };
+
     await ensureOwner({ takeover: true });
     await stateCall("enable");
     await configureConversation(interaction);
-    setStatus("connected", "LBP ● Enabled for this chat",
-      "Workflow instructions attach to your next message.");
+
+    setStatus(
+      "connected",
+      "LBP ● Enabled for this chat",
+      "Workflow instructions attach to your next message."
+    );
   }
 
   async function stop(reason = "stopped_by_user") {
     await stateCall("stop", { reason });
-  }
-
-  async function continueCheckpoint() {
-    const api = adapter();
-    let entry = [...taskView.values()].reverse().find((item) => item.result);
-    if (!entry) {
-      const pending = currentPendingRegistrationFor();
-      if (!pending) return;
-      const replay = await fetchStoredDelivery(pending.registrationId);
-      const result = replay.result;
-      entry = {
-        taskId: pending.taskId,
-        registrationId: pending.registrationId,
-        result,
-        deliveryId: replay.delivery_id || pending.deliveryId,
-        resultDigest: replay.result_digest || pending.resultDigest
-      };
-      setTaskView(pending.taskId, entry);
-    }
-    if (!entry) return;
-    await stateCall("request_continue");
-    const delivery = deliveryFrom({ registration_id: entry.registrationId, task_id: entry.taskId }, entry.result, entry);
-    if (!api.composerHoldsDelivery(delivery)) {
-      const insertion = await api.insertResult(entry.result, delivery);
-      if (!insertion.inserted) {
-        setStatus("error", "LBP ⚠ Composer changed", "Re-deliver the result before continuing.");
-        return;
-      }
-    }
-    const registration = { registration_id: entry.registrationId, task_id: entry.taskId };
-    await submitResult(registration, entry.result, delivery);
   }
 
   async function updateInteraction(next) {
@@ -702,30 +1006,98 @@ globalThis.LBP_COORDINATOR = (() => {
     return stateCall("remove_context_source", { source_id: sourceId });
   }
 
+  async function acknowledgeUnknown() {
+    const registrationId = daemonState?.current_registration;
+    const taskId = daemonState?.current_task_id;
+
+    logTransport("unknown_acknowledge_clicked", {
+      task_id: taskId || null,
+      registration_id: registrationId || null,
+      phase: daemonState?.phase || null,
+      stopped_reason: daemonState?.stopped_reason || null
+    });
+
+    if (
+      daemonState?.phase !== "stopped" ||
+      daemonState?.stopped_reason !== "unknown_mutation_state" ||
+      !registrationId
+    ) {
+      setStatus("paused", "LBP ⏸ Nothing to acknowledge", "No unknown mutation is awaiting acknowledgement.");
+      return;
+    }
+
+    try {
+      await stateCall("acknowledge_unknown", { registration: registrationId });
+      logTransport("unknown_acknowledge_success", {
+        task_id: taskId || null,
+        registration_id: registrationId,
+        phase: daemonState?.phase || null
+      });
+
+      if (taskId) {
+        setTaskView(taskId, {
+          status: "unknown",
+          detail: "Ambiguous result acknowledged by user"
+        });
+      }
+
+      setStatus(
+        "continuing",
+        "LBP ● Unknown state acknowledged",
+        "The ambiguous task was not retried or marked successful. The chain may continue with a new task."
+      );
+
+      await scan();
+    } catch (error) {
+      logTransport("unknown_acknowledge_failed", {
+        task_id: taskId || null,
+        registration_id: registrationId || null,
+        error: String(error?.message || error)
+      });
+      setStatus(
+        "error",
+        "LBP ⚠ Unknown acknowledgement failed",
+        String(error?.message || error)
+      );
+    }
+  }
+
   // Journal replay surfaced as a user action. This re-inserts the stored result;
   // it never re-enters MCP. Re-running work requires a newly authored task with a
   // new id, which is why there is no "Run again".
   async function redeliverResult(taskId) {
-    let entry = taskView.get(taskId);
-    if (!entry?.result) {
-      const pending = currentPendingRegistrationFor({ task_id: taskId });
-      if (!pending) return;
+    const pending = currentPendingRegistrationFor({ task_id: taskId });
+    if (!pending) return;
+
+    const registration = { registration_id: pending.registrationId, task_id: pending.taskId };
+    let result = resultCache.get(taskId) || null;
+    let deliveryMeta = pending;
+
+    if (!result) {
       const replay = await fetchStoredDelivery(pending.registrationId);
-      entry = {
-        taskId: pending.taskId,
+      if (replay.resultBytes > MAX_INLINE_RESULT_BYTES) {
+        await withholdOversizedResult(registration, replay.resultBytes);
+        return;
+      }
+      result = replay.result;
+      deliveryMeta = replay;
+      cacheInlineResult(taskId, result, replay.resultBytes);
+      setTaskView(taskId, {
+        taskId,
         registrationId: pending.registrationId,
-        result: replay.result,
-        deliveryId: replay.delivery_id || pending.deliveryId,
-        resultDigest: replay.result_digest || pending.resultDigest
-      };
-      setTaskView(pending.taskId, entry);
+        resultBytes: replay.resultBytes,
+        deliveryId: replay.delivery_id,
+        resultDigest: replay.result_digest
+      });
     }
-    const delivery = deliveryFrom({ registration_id: entry.registrationId, task_id: entry.taskId }, entry.result, entry);
-    const insertion = await adapter().insertResult(entry.result, delivery);
+
+    const delivery = deliveryFrom(registration, result, deliveryMeta);
+    const insertion = await adapter().insertResult(result, delivery);
     await stateCall("task_delivery_status", {
-      registration: entry.registrationId,
+      registration: pending.registrationId,
       status: insertion.inserted ? "inserted" : "failed"
     });
+    setTaskView(taskId, { delivery: insertion.inserted ? "inserted" : "failed" });
     setStatus(insertion.inserted ? "connected" : "error",
       insertion.inserted ? "LBP ● Result re-delivered" : "LBP ⚠ Re-delivery failed", taskId);
   }
@@ -740,6 +1112,15 @@ globalThis.LBP_COORDINATOR = (() => {
     await refreshState();
     if (!daemonState) return;
     const turns = await api.providerTurns({ conversationId: daemonState.conversation_id });
+    // logTransport("scan_snapshot", {
+    //   phase: daemonState?.phase,
+    //   enabled: daemonState?.enabled,
+    //   pending_human_send: daemonState?.pending_human_send,
+    //   last_user_turn_id: daemonState?.last_user_turn_id,
+    //   last_assistant_turn_id: daemonState?.last_assistant_turn_id,
+    //   user_turns: (turns.user || []).map((t) => t.id),
+    //   assistant_turns: (turns.assistant || []).map((t) => t.id)
+    // });
     await reconcileSubmittedResultTurn(turns);
     await reconcileTurns(turns);
     await recoverPendingDelivery();
@@ -764,53 +1145,150 @@ globalThis.LBP_COORDINATOR = (() => {
     }
   }
 
+  function mutationTouchesProviderMessage(mutation) {
+    const target = mutation.target?.nodeType === Node.ELEMENT_NODE
+      ? mutation.target
+      : mutation.target?.parentElement;
+
+    if (target?.closest?.("[data-message-author-role][data-message-id]")) {
+      return true;
+    }
+
+    for (const node of mutation.addedNodes || []) {
+      if (node.nodeType !== Node.ELEMENT_NODE) continue;
+
+      if (
+        node.matches?.("[data-message-author-role][data-message-id]") ||
+        node.querySelector?.("[data-message-author-role][data-message-id]")
+      ) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
   function start() {
     const api = adapter();
 
     api.onBeforeUserSend((event) => {
-      // Disabled really means off. Never arm a chain while the conversation is
-      // disabled; otherwise a normal ChatGPT send can create an executable chain
-      // even though the sidebar still shows Enable.
       if (daemonState?.enabled !== true) return;
+
       const pending = currentPendingRegistrationFor();
-      if (pending?.deliveryId && api.textContainsDelivery(event?.text || "", pending)) return;
 
-      // Attaching the bootstrap is a one-time courtesy, not a gate. Mark it
-      // attached FIRST: the state round trip is async, and a second send that
-      // lands before it resolves used to prepend the instructions again.
-      if (daemonState?.enabled && !daemonState?.workflow_attached) {
-        daemonState = { ...daemonState, workflow_attached: true };
-        const attached = api.prependComposerText(BOOTSTRAP_TEXT);
-        if (attached?.prepended) void stateCall("workflow_attached", { attached: true });
+      if (
+        pending?.deliveryId &&
+        api.textContainsDelivery(event?.text || "", pending)
+      ) {
+        return;
       }
-      // Arms the daemon only. The chain is created when the provider actually
-      // produces the turn, so a send that never happens changes nothing.
-      void (async () => {
-        const turns = await api.providerTurns({ conversationId: daemonState?.conversation_id || "" });
-        pendingHumanTurnBaseline = {
-          userIds: turnIdSet(turns, "user"),
-          assistantIds: turnIdSet(turns, "assistant")
-        };
-        await stateCall("arm_human_send");
-      })().catch(() => {});
-    });
 
-    const observer = new MutationObserver((mutations) => {
-      const relevant = mutations.some((mutation) => {
-        const node = mutation.target?.nodeType === Node.ELEMENT_NODE
-          ? mutation.target : mutation.target?.parentElement;
-        return !node?.closest?.(".lbp-global-status, .lbp-modal-overlay");
+      const baseline = api.providerTurnIdSnapshot();
+
+      logTransport("human_send_baseline", {
+        user_ids: [...baseline.userIds],
+        assistant_ids: [...baseline.assistantIds]
       });
-      if (relevant) void scan();
-    });
-    observer.observe(document.documentElement, { childList: true, characterData: true, subtree: true });
 
-    // This tab just loaded, so it is the live one: claim the lease before the
-    // first scan rather than waiting for the renewal interval.
-    void ensureOwner({ takeover: true }).then(() => scan());
-    // Low-frequency recovery fallback, not the primary workflow engine.
-    setInterval(() => void scan(), 5000);
-    setInterval(() => { if (!document.hidden) void ensureOwner(); }, 12000);
+      pendingHumanTurnBaseline = {
+        userIds: baseline.userIds,
+        assistantIds: baseline.assistantIds
+      };
+
+      if (
+        daemonState?.enabled &&
+        !daemonState?.workflow_attached
+      ) {
+        daemonState = {
+          ...daemonState,
+          workflow_attached: true
+        };
+
+        const attached = api.prependComposerText(
+          BOOTSTRAP_TEXT
+        );
+
+        if (attached?.prepended) {
+          void stateCall("workflow_attached", {
+            attached: true
+          });
+        }
+      }
+
+      void stateCall("arm_human_send")
+        .then((state) => {
+          logTransport("human_send_armed", {
+            phase: state?.phase,
+            pending_human_send:
+              state?.pending_human_send
+          });
+        })
+        .catch((error) => {
+          logTransport("human_send_arm_failed", {
+            error: String(
+              error?.message || error
+            )
+          });
+        });
+    });
+
+    /*
+    * Coalesce bursts of provider DOM mutations.
+    *
+    * ChatGPT can produce hundreds of mutations while streaming
+    * one assistant turn. They should wake the coordinator once,
+    * not create a tight scan loop.
+    */
+    let mutationScanTimer = null;
+
+    function scheduleProviderScan() {
+      if (mutationScanTimer !== null) {
+        return;
+      }
+
+      mutationScanTimer = setTimeout(() => {
+        mutationScanTimer = null;
+        void scan();
+      }, 100);
+    }
+
+    const observer = new MutationObserver(
+      (mutations) => {
+        if (
+          mutations.some(
+            mutationTouchesProviderMessage
+          )
+        ) {
+          scheduleProviderScan();
+        }
+      }
+    );
+
+    observer.observe(document.documentElement, {
+      childList: true,
+      characterData: true,
+      subtree: true
+    });
+
+    /*
+    * Claim this tab before first reconciliation.
+    */
+    void ensureOwner({
+      takeover: true
+    }).then(() => scan());
+
+    /*
+    * Recovery only. This is not the primary event source.
+    */
+    setInterval(() => {
+      void scan();
+    }, 5000);
+
+    setInterval(() => {
+      if (!document.hidden) {
+        void ensureOwner();
+      }
+    }, 12000);
   }
 
   return Object.freeze({
@@ -818,13 +1296,13 @@ globalThis.LBP_COORDINATOR = (() => {
     scan,
     enable,
     stop,
-    continueCheckpoint,
     updateInteraction,
     configureConversation,
     configuredContextSources,
     addContextSource,
     chooseContextFolder,
     removeContextSource,
+    acknowledgeUnknown,
     redeliverResult,
     runTask,
     subscribe: (fn) => { listeners.add(fn); return () => listeners.delete(fn); },

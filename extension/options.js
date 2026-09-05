@@ -7,6 +7,7 @@ let registryVersion = null;
 const DEFAULT_INTERACTION = Object.freeze({
   mode: "manual",
   max_round_trips: 12,
+  unknown_recovery: "manual",
   status_surface: "panel"
 });
 
@@ -15,13 +16,16 @@ function interactionConfig() {
   if (!["manual", "auto_continue"].includes(mode)) throw new Error("Invalid interaction mode.");
 
   const max = Number(document.querySelector("#interaction-max-rounds").value);
-  if (!Number.isInteger(max) || max < 1 || max > 50) {
-    throw new Error("Checkpoint interval must be an integer from 1 to 50 steps.");
+  if (!Number.isInteger(max) || max < 1 || max > 100) {
+    throw new Error("Checkpoint size must be an integer from 1 to 100 tasks.");
   }
+  const unknown_recovery = document.querySelector("#interaction-unknown-recovery").value;
+  if (!["manual", "auto_continue"].includes(unknown_recovery)) throw new Error("Invalid unknown recovery mode.");
 
   return {
     mode,
     max_round_trips: max,
+    unknown_recovery,
     status_surface: "panel"
   };
 }
@@ -34,7 +38,9 @@ async function loadInteraction() {
 
   const max = Number(raw.max_round_trips);
   document.querySelector("#interaction-max-rounds").value =
-    Number.isInteger(max) && max >= 1 && max <= 50 ? max : 12;
+    Number.isInteger(max) && max >= 1 && max <= 100 ? max : 12;
+  document.querySelector("#interaction-unknown-recovery").value =
+    raw.unknown_recovery === "auto_continue" ? "auto_continue" : "manual";
 
   void raw.status_surface;
 }
@@ -97,8 +103,7 @@ function serverConfig(card) {
       allow_destructive,
       approval_mode: card.querySelector(".server-approval-mode").value,
       approval_escalation: card.querySelector(".server-approval-escalation").value,
-      always_approve_destructive: card.querySelector(".server-destructive-approval").checked,
-      freeform_write_tools: lines(card.querySelector(".server-freeform-write").value)
+      always_approve_destructive: card.querySelector(".server-destructive-approval").checked
     }
   };
 }
@@ -191,7 +196,6 @@ function addServer(id = "", cfg = {}) {
   card.querySelector(".server-approval-mode").value = cfg.approval_mode || "mutations";
   card.querySelector(".server-approval-escalation").value = cfg.approval_escalation || "chain";
   card.querySelector(".server-destructive-approval").checked = cfg.always_approve_destructive !== false;
-  card.querySelector(".server-freeform-write").value = (cfg.freeform_write_tools || []).join("\n");
 
   card.querySelector(".server-write").addEventListener("change", (event) => {
     if (!event.currentTarget.checked) card.querySelector(".server-destructive").checked = false;

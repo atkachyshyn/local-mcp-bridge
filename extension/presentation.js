@@ -92,19 +92,10 @@ globalThis.LBP_PRESENTATION = (() => {
     const metaStatus = el("span", "lbp-meta-status");
     const metaMode = el("span", "lbp-meta-mode");
     const metaCount = el("span", "lbp-meta-count");
-    metaLeft.append(
-      activeDot,
-      metaStatus,
-      el("span", "lbp-meta-sep", "·"),
-      metaMode,
-      el("span", "lbp-meta-sep", "·"),
-      metaCount
-    );
+    metaLeft.append(activeDot, metaStatus, metaMode, metaCount);
     const metaRight = el("div", "lbp-meta-right");
     const checkpointAt = el("span", "lbp-checkpoint-at");
-    const bookmark = icon("bookmark", "lbp-bookmark");
-    bookmark.setAttribute("aria-hidden", "true");
-    metaRight.append(checkpointAt, bookmark);
+    metaRight.append(checkpointAt);
     progressMeta.append(metaLeft, metaRight);
 
     const timeline = el("div", "lbp-timeline");
@@ -166,15 +157,13 @@ globalThis.LBP_PRESENTATION = (() => {
     }
 
     const enable = actionButton("Enable", "enable");
-    const checkpoint = actionButton("Continue to next checkpoint", "checkpoint");
     const stop = actionButton("Stop chain", "stop");
     const settings = actionButton("Settings", "settings");
 
     enable.addEventListener("click", () => void coordinator().enable());
-    checkpoint.addEventListener("click", () => void coordinator().continueCheckpoint());
     stop.addEventListener("click", () => void coordinator().stop());
     settings.addEventListener("click", () => chrome.runtime.sendMessage({ type: "lbp-open-options" }));
-    actions.append(enable, checkpoint, stop, settings);
+    actions.append(enable, stop, settings);
     panel.append(progress, outputs, context, actions);
     root.append(pill, panel);
 
@@ -221,7 +210,7 @@ globalThis.LBP_PRESENTATION = (() => {
       metaMode, metaCount, checkpointAt, timeline, list, outputs, outputsSummary,
       outputsCount, outputsList, context, contextChips, contextMenu,
       contextAdd, contextNotice, contextDetails, footerMeta, autoToggle,
-      autoToggleInput, actions, enable, checkpoint, stop, settings
+      autoToggleInput, actions, enable, stop, settings
     };
     return ui;
   }
@@ -280,12 +269,11 @@ globalThis.LBP_PRESENTATION = (() => {
     const phase = state.phase || "disabled";
     // A running chain stays "Active" as the reference specifies; the step row
     // already says "In progress". Only the states the reference does not depict
-    // -- stopped and checkpoint -- get their own label.
+    // -- stopped -- gets its own label.
     // `enabled` only means "the model was given the instructions", so it is no
     // longer a status. What matters is whether a run is live.
     const status = phase === "disabled" ? "Off"
       : phase === "stopped" ? "Stopped"
-      : phase === "checkpoint" ? "Checkpoint"
       : state.active_chain ? "Active"
       : "Idle";
     void enabled;
@@ -346,7 +334,13 @@ globalThis.LBP_PRESENTATION = (() => {
       bits.push(statusLabel(task.delivery_status));
     }
     if (view.detail) bits.push(view.detail);
-    if (status === "unknown") bits.push("Auto-continuation stopped");
+    if (status === "unknown") {
+      if (task.unknown_acknowledged_at) {
+        bits.push("Acknowledged", "Chain resumed");
+      } else {
+        bits.push("Auto-continuation stopped");
+      }
+    }
     const time = stepTime(task);
     if (time) bits.push(time);
     return bits.filter(Boolean).join(" · ");
@@ -363,6 +357,12 @@ globalThis.LBP_PRESENTATION = (() => {
     if (action) copy.append(action);
     row.append(copy);
     surface.list.append(row);
+  }
+
+  function focusNewestStep(surface) {
+    requestAnimationFrame(() => {
+      surface.timeline.scrollTop = surface.timeline.scrollHeight;
+    });
   }
 
   function renderProgress(surface, state) {
@@ -387,13 +387,12 @@ globalThis.LBP_PRESENTATION = (() => {
           detail: taskDetail(status === "current" ? "current" : status, view, task)
         });
       });
+      focusNewestStep(surface);
       return;
     }
 
-    const chain = state.active_chain || {};
-    const window = Number(chain.window || 0);
     const tasks = (state.recent_tasks || [])
-      .filter((task) => Number(task.window || 0) === window)
+      .slice()
       .sort((a, b) => Number(a.sequence || 0) - Number(b.sequence || 0));
     if (!tasks.length) {
       // An empty track with nothing but the rail reads as broken. Say what the
@@ -421,13 +420,28 @@ globalThis.LBP_PRESENTATION = (() => {
       let action = null;
       const terminal = ["completed", "error", "unknown"].includes(status);
       const undelivered = !task.delivery_status || task.delivery_status !== "submitted";
-      if (terminal && undelivered && view.result) {
+      const unknownRecovery =
+        status === "unknown" &&
+        state.phase === "stopped" &&
+        state.stopped_reason === "unknown_mutation_state" &&
+        task.task_id === state.current_task_id;
+
+      if (unknownRecovery && state.unknown_recovery === "auto_continue") {
+        action = el("div", "lbp-task-action lbp-task-action-static", "Auto-resume after result confirmation");
+      } else if (unknownRecovery) {
+        action = el("button", "lbp-task-action", "Acknowledge and continue");
+        action.type = "button";
+        action.addEventListener("click", () => void coordinator().acknowledgeUnknown());
+      } else if (terminal && undelivered && view.delivery !== "oversized") {
+        // taskView no longer holds the raw result body (see coordinator.js);
+        // an oversized/withheld result can never be re-delivered to the
+        // composer, so only gate on that, not on a cached result object.
         action = el("button", "lbp-task-action", "Re-deliver result");
         action.type = "button";
         action.addEventListener("click", () => void coordinator().redeliverResult(task.task_id));
       }
       appendStep(surface, {
-        index: index + 1,
+        index: Number(task.sequence || (index + 1)),
         title: task.title || task.task_id,
         status,
         current,
@@ -435,6 +449,7 @@ globalThis.LBP_PRESENTATION = (() => {
         action
       });
     });
+    focusNewestStep(surface);
   }
 
   function renderOutputs(surface, state) {
@@ -666,7 +681,6 @@ globalThis.LBP_PRESENTATION = (() => {
       surface.autoToggleInput.checked = false;
       surface.autoToggleInput.disabled = true;
       surface.enable.hidden = true;
-      surface.checkpoint.hidden = true;
       surface.stop.hidden = true;
       surface.list.innerHTML = "";
       renderOutputs(surface, null);
@@ -684,8 +698,7 @@ globalThis.LBP_PRESENTATION = (() => {
 
     const phase = state.phase || "disabled";
     surface.enable.hidden = state.enabled === true;
-    surface.checkpoint.hidden = phase !== "checkpoint";
-    surface.stop.hidden = !state.active_chain || phase === "checkpoint" || ["disabled", "stopped"].includes(phase);
+    surface.stop.hidden = !state.active_chain || ["disabled", "stopped"].includes(phase);
     surface.autoToggleInput.checked = state.mode === "auto_continue";
     surface.autoToggleInput.disabled = false;
 
@@ -740,11 +753,11 @@ globalThis.LBP_PRESENTATION = (() => {
       actions.append(button("Deny", "deny", "lbp-deny"));
       actions.append(button("Allow once", "once", "lbp-once"));
       if (approval.chain_approval_available) {
-        // "Allow this chain" is the CURRENT checkpoint window and nothing wider.
+        // "Approve until checkpoint" is the CURRENT approval window and nothing wider.
         // The daemon derives that scope; continuing past a checkpoint necessarily
         // requires a fresh approval.
         actions.append(button(
-          `Allow this chain (this window of ${Number(preview.window_limit || 12)})`,
+          "Approve until checkpoint",
           "chain", "lbp-chain"));
       }
       if (approval.session_approval_available) {

@@ -19,6 +19,8 @@ for (const k of ['document','Node','Element','HTMLElement','HTMLButtonElement','
                  'HTMLTextAreaElement','Event','InputEvent','KeyboardEvent','MutationObserver',
                  'getComputedStyle']) global[k] = win[k];
 global.window = win;
+global.requestAnimationFrame = win.requestAnimationFrame.bind(win);
+global.cancelAnimationFrame = win.cancelAnimationFrame.bind(win);
 global.navigator = win.navigator;
 global.location = { hostname: 'chatgpt.com', pathname: '/c/x' };
 global.crypto = { randomUUID: () => 'u' };
@@ -33,7 +35,7 @@ globalThis.LBP_COORDINATOR = {
   identity: () => ({ bridgeVersion: '0.9.2', lbpVersion: '1.3' }),
   interaction: () => ({ mode: 'manual', max_round_trips: 12, status_surface: 'panel' }),
   taskViews: () => new Map(), updateInteraction: async () => {},
-  enable: async () => {}, stop: async () => {}, continueCheckpoint: async () => {},
+  enable: async () => {}, stop: async () => {},
   redeliverResult: async () => {}, addContextSource: async () => {}, removeContextSource: async () => {},
   chooseContextFolder: async () => ({ cancelled: true }), configuredContextSources: async () => []
 };
@@ -76,6 +78,14 @@ function addTurn(role, id, parts) {
     }
   }
   host.appendChild(markdown);
+  // jsdom does not implement browser innerText block separation here: its
+  // textContent concatenates <p>/<pre>/<p> with no newlines, which puts an
+  // otherwise valid <LBP_TASK> tag mid-line. Real ChatGPT innerText preserves
+  // those visible block boundaries, so model the settled provider turn exactly.
+  Object.defineProperty(host, 'innerText', {
+    configurable: true,
+    get: () => parts.map((part) => part.text).join('\n')
+  });
   win.document.body.appendChild(host);
   return host;
 }

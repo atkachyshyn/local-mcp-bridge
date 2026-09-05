@@ -804,15 +804,23 @@ check('result recovery is acknowledged before human-turn reconciliation', () => 
     'manual-send recovery must acknowledge by provider turn id and delivery id');
 });
 
-check('reload recovery replays stored results without a browser task ledger', () => {
+check('pending delivery recovery is limited to result_ready or stopped unknown mutation', () => {
   const coordinator = withoutComments(fs.readFileSync('extension/coordinator.js', 'utf8'));
-  assert.ok(/function recoverPendingDelivery/.test(coordinator));
-  assert.ok(/daemonState\?\.phase\s*!==\s*"result_ready"/.test(coordinator),
-    'recovery must be limited to the result_ready delivery phase');
-  assert.ok(/fetchStoredDelivery\(pending\.registrationId\)/.test(coordinator),
-    'pending delivery must recover from the daemon journal after reload');
-  assert.ok(/deliveryStatus === "inserted"[\s\S]*composerHoldsDelivery[\s\S]*submitResult/.test(coordinator),
-    'auto retry should submit an inserted pending result without rewriting it');
+  const start = coordinator.indexOf('async function recoverPendingDelivery()');
+  const end = coordinator.indexOf('async function enable()', start);
+  assert.ok(start >= 0 && end > start, 'recoverPendingDelivery function not found');
+  const recover = coordinator.slice(start, end);
+  assert.ok(recover.includes('daemonState?.phase === "result_ready"'));
+  assert.ok(recover.includes('daemonState?.phase === "stopped" && daemonState?.stopped_reason === "unknown_mutation_state"'));
+  assert.equal(recover.includes('stopped_by_user'), false,
+    'unrelated stopped states must not recover pending delivery');
+});
+
+check('unknown results use normal auto-submit delivery even while chain continuation is stopped', () => {
+  const coordinator = withoutComments(fs.readFileSync('extension/coordinator.js', 'utf8'));
+  assert.ok(coordinator.includes('const auto = daemonState?.mode === "auto_continue";'));
+  assert.equal(coordinator.includes('const auto = daemonState?.mode === "auto_continue" && daemonState?.phase !== "stopped";'), false);
+  assert.ok(/phase === ["']stopped["']\s*&&\s*daemonState\?\.stopped_reason === ["']unknown_mutation_state["']/.test(coordinator));
 });
 
 check('unknown recovery UI distinguishes manual acknowledgement from auto recovery', () => {

@@ -787,7 +787,10 @@ globalThis.LBP_COORDINATOR = (() => {
     if (deliveringRegistrations.has(registrationId)) return;
     deliveringRegistrations.add(registrationId);
     try {
-      const auto = daemonState?.mode === "auto_continue" && daemonState?.phase !== "stopped";
+      // Delivery policy and execution-stop policy are independent. An unknown
+      // mutation stops chain continuation, but its result still follows the normal
+      // auto-submit policy so ChatGPT can inspect it before recovery is acknowledged.
+      const auto = daemonState?.mode === "auto_continue";
 
       const insertion = await api.insertResult(result, delivery);
       if (!insertion.inserted) {
@@ -875,7 +878,10 @@ globalThis.LBP_COORDINATOR = (() => {
   }
 
   async function recoverPendingDelivery() {
-    if (daemonState?.phase !== "result_ready") return;
+    const recoverablePhase =
+      daemonState?.phase === "result_ready" ||
+      (daemonState?.phase === "stopped" && daemonState?.stopped_reason === "unknown_mutation_state");
+    if (!recoverablePhase) return;
     const pending = currentPendingRegistrationFor();
     if (!pending || deliveringRegistrations.has(pending.registrationId)) return;
 

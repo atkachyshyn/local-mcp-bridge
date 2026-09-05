@@ -48,7 +48,7 @@
   continues to come from the MCP catalog/annotations plus the daemon's existing
   classification, root, approval and destructive policies; there is no separate
   operator-maintained free-form payload allowlist.
-- **Stabilization baseline is fully green:** 79 daemon checks, 68 browser checks,
+- **Stabilization baseline is fully green:** 79 daemon checks, 69 browser checks,
   15 sidebar-reference checks and 4 append-only transport invariant checks.
 
 ## 0.9.2 — 2026-09-03
